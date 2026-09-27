@@ -1,0 +1,209 @@
+CALebe Helper - Implementações da extensão
+Versão documentada: 1.5.2
+
+1. OBJETIVO
+
+O Calebe Helper é uma extensão Manifest V3 para auxiliar operações no sistema Calebe/SATGO. Ela acrescenta automações de clientes, DAVs, importação de dados do Excel, atalhos de navegação, preenchimento de campos cadastrais, consulta de dados públicos e download em lote de XML/PDF de notas.
+
+O sistema principal atendido é:
+https://s1.satgo.com.br/
+
+Também é utilizada a página do Sintegra de Goiás para consulta de inscrição estadual:
+https://appasp.sefaz.go.gov.br/
+
+2. IMPORTAÇÃO DO EXCEL E PREENCHIMENTO DE DAV
+
+Arquivos: popup.html, fillexcel_init.js e fillexcel_modal.js.
+
+- O popup da extensão recebe dados colados diretamente do Excel.
+- A área de colagem espera seis colunas por linha.
+- O usuário pode importar, limpar a área colada e abrir o painel de preenchimento dentro do Calebe.
+- O painel pode ser minimizado, fechado e reposicionado por arraste.
+- A posição, o tema e o layout do painel são persistidos no armazenamento local da extensão.
+- O painel acompanha mudanças de tamanho da janela e limita sua posição para continuar visível.
+- Há controle para remover linhas concluídas ou limpar todas as linhas.
+- Cada linha importada possui seleção independente para os produtos 21, 22 ou outro produto.
+- O botão de preenchimento executa uma linha por vez e mostra o status da operação.
+- Linhas concluídas permanecem identificadas no painel.
+- O fluxo principal de uma linha é:
+  1. criar uma nova DAV;
+  2. preencher a observação;
+  3. selecionar e confirmar o cliente;
+  4. aguardar o produto quando ele precisar ser informado manualmente;
+  5. carregar o produto configurado;
+  6. aplicar o coeficiente/preço unitário;
+  7. calcular a quantidade necessária para atingir o total informado;
+  8. conferir o total dos itens.
+- Para “Vários itens”, o produto pode ser escolhido manualmente no Calebe e a quantidade necessária para completar o total é calculada conforme os itens são ajustados.
+- A extensão não cria automaticamente novos clientes sem código cadastrado; nesses casos a linha é informada como não habilitada para o fluxo automático.
+- O preenchimento não fecha ou finaliza a DAV sem a participação do usuário no fechamento final.
+- A extensão exibe mensagens de andamento, sucesso e falha no próprio painel.
+
+3. CRIAÇÃO DE NOVA DAV A PARTIR DE CLIENTES
+
+Arquivo: clientedav.js.
+
+- Acrescenta uma ação de criação de DAV nas linhas de clientes cadastrados.
+- A ação identifica o código e o nome do cliente selecionado.
+- Abre a área nativa de DAVs, aciona “Novo DAV” e aguarda a tela ficar pronta.
+- Persiste temporariamente o cliente escolhido para sobreviver à troca/recriação do iframe.
+- Na nova DAV, localiza o campo de cliente e usa a rotina compartilhada de pesquisa/confirmação.
+- Confirma o cliente pelo código e conserva nome/código básicos mesmo quando o detalhamento opcional não estiver disponível.
+- Observa o documento principal e o iframe do Calebe, pois o sistema recria partes da interface durante a navegação.
+- Impede a criação concorrente de duas DAVs para o mesmo fluxo pendente.
+- Valida se o botão nativo de nova DAV está visível, habilitado e realmente pronto antes de acioná-lo.
+
+4. CADASTRO DE NOVO CLIENTE E “SALVAR + DAV”
+
+Arquivo: clientecadastro.js.
+
+- No formulário de cadastro de cliente/fornecedor, acrescenta o botão “DAV”.
+- O botão separado salva o novo cliente e, somente depois da confirmação do salvamento, abre uma nova DAV para esse cliente.
+- O código do cliente é obtido do cadastro salvo; a extensão não tenta adivinhar código sequencial.
+- O fluxo espera o novo carregamento do iframe antes de iniciar a DAV.
+- Se o Calebe exibir erro no salvamento, a DAV não é aberta.
+- A ação é exclusiva do cadastro de cliente novo e não altera as ações de clientes já existentes.
+- O botão nativo de salvar continua separado do botão “Salvar e abrir DAV”.
+
+5. EDIÇÃO, DUPLICAÇÃO E EXCLUSÃO DE CLIENTES
+
+Arquivo: clienteduplicar.js.
+
+- Na listagem de clientes, intercepta a ação nativa de duplicação.
+- Realiza a duplicação por requisição ao endpoint nativo, enviando os dados do formulário e preservando a sessão atual.
+- Verifica a resposta HTTP e procura a confirmação de que o registro foi duplicado.
+- Identifica o novo cliente comparando os IDs existentes antes e depois da operação.
+- Abre a tela de edição do novo cliente somente depois de identificar o registro com segurança.
+- Acrescenta, na edição, ações separadas para duplicar e abrir DAV.
+- Acrescenta ação para excluir o cliente duplicado, usando a confirmação/exclusão nativa do Calebe.
+- Acrescenta “Salvar + DAV” na edição do cliente duplicado ou editado.
+- O salvamento é concluído antes da abertura da DAV.
+- Guarda temporariamente a intenção de abrir a DAV durante a troca de tela e remove esse estado após concluir ou falhar.
+- Mantém exclusão e duplicação fora do bloqueio visual usado durante outros fluxos.
+- Desabilita apenas os controles auxiliares enquanto uma operação equivalente está em andamento.
+- Não reativa um fluxo antigo de duplicação por sessionStorage/POST que tenha sido removido; a implementação atual valida a resposta e o novo ID.
+
+6. PESQUISA E HISTÓRICO DE CLIENTES
+
+Arquivo: clientepesquisa.js.
+
+- Mantém a pesquisa de clientes em módulo isolado das rotinas de DAV, NFE, XML e bridge.
+- Usa o caminho de pesquisa existente do Calebe.
+- Mantém histórico local de pesquisas na chave calebeClientSearchHistoryV1.
+- Permite reutilizar pesquisas recentes sem restaurar o autocomplete nativo ou alterar a detecção nativa de inputType.
+- Faz deduplicação por código do cliente.
+- Preserva as colunas e ações nativas da listagem do Calebe.
+- O histórico funciona como ajuda de pesquisa e não preenche automaticamente observação, produtos ou outros campos da DAV.
+
+7. PADRONIZAÇÃO DO FORMULÁRIO DE CLIENTE
+
+Arquivo: clientecampos.js.
+
+- Normaliza CPF/CNPJ durante entrada, colagem e saída do campo.
+- Adiciona consulta de inscrição estadual pelo botão de busca de CNPJ.
+- Envia a consulta ao service worker, que consulta o Sintegra de Goiás em uma aba controlada.
+- Preenche a inscrição estadual quando o Sintegra retorna esse dado.
+- Trata respostas inválidas ou indisponibilidade sem interromper o cadastro.
+- Padroniza razão social em letras maiúsculas.
+- Padroniza e-mail e site em letras minúsculas.
+- Normaliza telefone fixo, celular e fax.
+- Padroniza campos de logradouro, complemento e bairro.
+- Observa o formulário e reaplica as regras quando o iframe ou os campos são recriados.
+- Trata o aviso de data de nascimento quando o Calebe apresenta esse modal.
+
+8. ATALHOS DO DASHBOARD
+
+Arquivo: dashboardatalhos.js.
+
+- Adiciona atalhos na barra superior do dashboard principal.
+- Disponibiliza acesso rápido para clientes, novo cliente/fornecedor, DAVs e novo DAV.
+- Usa ícones e textos próprios sem substituir a navegação nativa.
+- Mantém os atalhos no documento principal do Calebe.
+- Acompanha a existência/recriação do iframe somente quando necessário para concluir ações pendentes.
+- As ações de novo cliente e novo DAV aguardam a tela correspondente ficar pronta.
+
+9. ENRIQUECIMENTO DA LISTAGEM DE DAVs
+
+Arquivo: dav1.js.
+
+- Atua na tela DAV01 - Documento Auxiliar de Venda.
+- Acrescenta um botão “Caixa DAV” junto às ações de cada DAV.
+- Usa a ação nativa de abertura de caixa da DAV.
+- Consulta detalhes de clientes associados às DAVs pela bridge da extensão.
+- Exibe código, nome e detalhes disponíveis do cliente na listagem.
+- O enriquecimento é visual/opcional: a falta de detalhes não impede as operações básicas da DAV.
+- Observa a troca do iframe e as alterações da tabela para reaplicar os elementos quando a listagem é atualizada.
+
+10. CONSULTA ENTRE A PÁGINA E O CONTEXTO DA EXTENSÃO
+
+Arquivo: page-bridge.js.
+
+- É executado no mundo MAIN para ter acesso ao contexto da página do Calebe.
+- Intercepta respostas relacionadas à consulta de cliente e publica eventos internos com os dados recebidos.
+- Consulta cliente por código no endpoint relativo dav01_ajax.php.
+- Valida status HTTP, content-type e JSON antes de usar a resposta.
+- Publica eventos de detalhes do cliente para os módulos que precisam apenas de enriquecimento visual.
+- Publica dados de clientes associados às DAVs.
+- Recebe comandos internos para consulta de cliente e operações relacionadas à DAV/NF-e.
+- Solicita geração/download de XML ou PDF pelo endpoint nativo nfe001_ajax.php.
+- Responde aos módulos de conteúdo por eventos calebe-helper:command-result.
+- Usa URLs relativas para preservar a sessão autenticada fornecida pelo wrapper do Calebe.
+
+11. DOWNLOAD EM LOTE DE XML E PDF DE NF-e
+
+Arquivo: xml-downloader.js.
+
+- Atua na tela de notas fiscais do módulo NF-e.
+- Acrescenta seleção individual por nota.
+- Acrescenta seleção de todas as notas.
+- Mostra a quantidade de notas selecionadas.
+- Acrescenta escolha do tipo de arquivo XML ou PDF.
+- Acrescenta botão para baixar os arquivos selecionados em lote.
+- Mantém o cabeçalho e as colunas nativas da tabela, reparando a estrutura quando necessário.
+- Exibe o endereço do destinatário quando ele pode ser obtido no XML.
+- Analisa o XML recebido e extrai os dados de endereço do cliente da nota.
+- Baixa cada arquivo usando a rotina nativa disponível para a nota.
+- Desabilita o botão e exibe indicador de processamento durante os downloads.
+- Informa a quantidade concluída e os erros individuais sem interromper todos os downloads restantes.
+- Reaplica os controles quando a tabela é atualizada dinamicamente.
+
+12. SERVICE WORKER E CONSULTA SINTEGRA
+
+Arquivo: sw.js.
+
+- Executa como service worker Manifest V3.
+- Recebe a mensagem CALEBE_SINTEGRA_GO.
+- Limpa e formata o CNPJ informado.
+- Reutiliza uma aba existente do Sintegra quando possível ou cria uma aba em segundo plano.
+- Executa a consulta na página do Sintegra.
+- Aguarda o carregamento da aba antes de executar a requisição.
+- Retorna a inscrição estadual ou a falha da consulta ao formulário do Calebe.
+- Fecha a aba criada pela extensão ao terminar, quando aplicável.
+
+13. INTERFACE E ESTILOS
+
+Arquivos: styles.css, popup.css e estilos injetados pelos módulos.
+
+- Estiliza o painel de importação, seus estados, botões, tabelas e mensagens.
+- Estiliza os botões adicionais inseridos no dashboard, cadastro, edição, DAV e NF-e.
+- Mantém os botões auxiliares visualmente separados das ações nativas.
+- Usa estados de foco, hover, ocupado, sucesso, alerta e erro.
+- Os componentes são inseridos somente quando a tela correspondente é reconhecida.
+
+14. PERMISSÕES E ÁREAS DE ATUAÇÃO
+
+- storage: persistência de configurações e histórico.
+- activeTab/tabs: interação com a aba ativa e controle da aba do Sintegra.
+- scripting: execução controlada da consulta no Sintegra.
+- host s1.satgo.com.br: operação dentro do Calebe.
+- host appasp.sefaz.go.gov.br: consulta de inscrição estadual.
+- Os ícones da extensão ficam na pasta icons e são declarados no manifest para a ação do navegador.
+
+15. LIMITES IMPORTANTES
+
+- A extensão depende de uma sessão autenticada e da estrutura atual do Calebe/SATGO.
+- O preenchimento automático não substitui a conferência e o fechamento final da DAV pelo usuário.
+- Detalhes opcionais de cliente podem não aparecer quando o endpoint não responder, sem impedir o fluxo básico.
+- O comportamento visual final depende do navegador, do iframe e da versão do sistema Calebe.
+- A extensão não deve misturar a pesquisa de clientes com as rotinas de DAV, NF-e, XML ou bridge.
+- A versão do projeto e do release deve permanecer sincronizada em manifest.json nos campos version e version_name.
