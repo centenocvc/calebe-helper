@@ -25,6 +25,7 @@
     multiSession: null
   };
   let lastPanelPointerAt = 0;
+  let autoMinimizedPanel = false;
 
   function extensionContextValid() {
     try {
@@ -607,6 +608,35 @@
     }
   }
 
+  async function applyExactItemTotal(target, unit, qty, liquid, unitValue) {
+    if (!(target > 0) || !(unitValue > 0)) throw new Error('Total ou valor unitário inválido para ajustar a quantidade.');
+    const rawQty = target / unitValue;
+    const finalQty = Math.ceil((rawQty - 1e-10) * 1000) / 1000;
+    const gross = Math.round(finalQty * unitValue * 100) / 100;
+    const discount = Math.max(0, Math.round((gross - target) * 100) / 100);
+
+    setNativeValue(unit, unitValue);
+    await sleep(100);
+    setNativeValue(qty, finalQty);
+    await sleep(120);
+
+    if (discount > 0.001) {
+      const tipoDesconto = await waitFor(() => getCalebeDoc().getElementById('tipoDesconto'), { message: '#tipoDesconto não encontrado para corrigir o arredondamento.' });
+      const desc = await waitFor(() => getCalebeDoc().getElementById('inlinePrdVlDesc'), { message: '#inlinePrdVlDesc não encontrado para corrigir o arredondamento.' });
+      if (tipoDesconto.disabled || desc.disabled) throw new Error('Os campos de desconto estão bloqueados; não foi possível acertar o valor exato.');
+      if (String(tipoDesconto.value) !== '1') setNativeValue(tipoDesconto, '1');
+      await sleep(100);
+      setNativeValue(desc, discount.toFixed(2).replace('.', ','));
+    }
+
+    await waitFor(() => {
+      const currentLiquid = getCalebeDoc().getElementById('inlinePrdVlLiq') || liquid;
+      const value = parseMoney(currentLiquid.value);
+      return Number.isFinite(value) && Math.abs(value - target) <= 0.01;
+    }, { timeout: 5000, message: `O valor líquido não atingiu ${money(target)} após ajustar a quantidade.` });
+    return { quantity: finalQty, discount };
+  }
+
   async function fillSingleItem(total) {
     await applyCoefficientWhileWaitingForProduct();
     const unit = await waitFor(() => getCalebeDoc().getElementById('inlinePrdVlUnit'), { message: '#inlinePrdVlUnit nao encontrado.' });
@@ -614,34 +644,21 @@
     const liquid = await waitFor(() => getCalebeDoc().getElementById('inlinePrdVlLiq'), { message: '#inlinePrdVlLiq nao encontrado.' });
     const productCode = String(findProductInput()?.value || '').trim();
     const configuredCoefficient = coefficientForProduct(productCode);
-    const coef = configuredCoefficient > 0 ? configuredCoefficient : parseMoney(unit.value);
-    if (!(coef > 0)) throw new Error('Valor unitário do produto inválido.');
+    const unitValue = configuredCoefficient > 0 ? configuredCoefficient : parseMoney(unit.value);
+    if (!(unitValue > 0)) throw new Error('Valor unitário do produto inválido.');
 
-    setNativeValue(unit, coef);
-    await sleep(80);
-
-    const rawQty = total / coef;
-    const hasMoreThanThreeDecimals = Math.abs(rawQty * 1000 - Math.round(rawQty * 1000)) > 1e-9;
-    const finalQty = hasMoreThanThreeDecimals ? Math.ceil(rawQty * 1000) / 1000 : rawQty;
-    setNativeValue(qty, finalQty);
-
-    if (hasMoreThanThreeDecimals) {
-      const tipoDesconto = await waitFor(() => getCalebeDoc().getElementById('tipoDesconto'), { message: '#tipoDesconto nao encontrado.' });
-      if (String(tipoDesconto.value) !== '1') setNativeValue(tipoDesconto, '1');
-      await sleep(80);
-
-      const discount = (finalQty * coef) - total;
-      if (discount > 0.001) {
-        const desc = await waitFor(() => getCalebeDoc().getElementById('inlinePrdVlDesc'), { message: '#inlinePrdVlDesc nao encontrado.' });
-        setNativeValue(desc, discount.toFixed(2).replace('.', ','));
+    try {
+      await applyExactItemTotal(total, unit, qty, liquid, unitValue);
+    } catch (firstError) {
+      // Fallback: reaplica quantidade e desconto uma única vez caso o Calebe não recalcule na primeira tentativa.
+      status(`O valor do item não fechou; tentando corrigir a quantidade para ${money(total)}...`, 'warn');
+      await sleep(350);
+      try {
+        await applyExactItemTotal(total, unit, qty, liquid, unitValue);
+      } catch (retryError) {
+        throw new Error(`Falha no acerto automático do item. Primeira tentativa: ${firstError.message} Segunda tentativa: ${retryError.message}`);
       }
     }
-
-    await waitFor(() => {
-      const currentLiquid = getCalebeDoc().getElementById('inlinePrdVlLiq') || liquid;
-      const n = parseMoney(currentLiquid.value);
-      return Number.isFinite(n) && Math.abs(n - total) <= 0.01;
-    }, { timeout: 5000, message: `Valor liquido nao atingiu ${money(total)}.` });
     await sleep(500);
   }
   async function ensureCurrentDavTotalMatches(total) {
@@ -651,18 +668,41 @@
       const raw = 'value' in totalEl ? totalEl.value : totalEl.textContent;
       return parseMoney(raw);
     };
-    const matches = () => {
-      const n = readTotNf();
-      return Number.isFinite(n) && Math.abs(n - total) <= 0.01;
+
+    // ⬛ Bloco: pausa a conferência enquanto a janela/aba do Calebe não está em foco.
+    // O tempo fora de foco não conta como tempo de espera; ao voltar, a busca é retomada.
+    const pageHasFocus = () => {
+      try {
+        return document.visibilityState !== 'hidden' && document.hasFocus();
+      } catch (_) {
+        return false;
+      }
     };
-    await waitFor(matches, {
-      timeout: 8000,
-      message: `Fechamento bloqueado: #totNF nao atingiu o total esperado ${money(total)}.`
-    });
-    await sleep(500);
-    const current = readTotNf();
-    if (!Number.isFinite(current) || Math.abs(current - total) > 0.01) {
-      throw new Error(`Fechamento bloqueado: #totNF esta ${money(current)} e o esperado e ${money(total)}.`);
+
+    while (!pageHasFocus()) {
+      await sleep(250);
+    }
+
+    let stableMatches = 0;
+    while (true) {
+      // Se o usuário mudar para outra janela/aba, suspende a leitura do total.
+      if (!pageHasFocus()) {
+        stableMatches = 0;
+        await sleep(250);
+        continue;
+      }
+
+      const current = readTotNf();
+      if (Number.isFinite(current) && Math.abs(current - total) <= 0.01) {
+        stableMatches++;
+        // Exige duas leituras iguais separadas por 250 ms para evitar avançar
+        // com um valor transitório durante a atualização do Calebe.
+        if (stableMatches >= 2) return;
+      } else {
+        stableMatches = 0;
+      }
+
+      await sleep(250);
     }
   }
   function armMultiItem(row) {
@@ -681,6 +721,7 @@
       lastProduct: initialProduct,
       lastLiquid: 0,
       lastQuantity: 0,
+      quantityBlankSince: 0,
       pendingProducts,
       switching: false,
       timer: null
@@ -688,6 +729,7 @@
 
     session.timer = setInterval(async () => {
       if (state.multiSession !== session) return clearInterval(session.timer);
+      if (session.adjusting) return;
       try {
         const d = getCalebeDoc();
         const p = findProductInput();
@@ -710,16 +752,37 @@
           return;
         }
         if (Number.isFinite(curLiquid) && curLiquid > 0) session.lastLiquid = curLiquid;
-        if (Number.isFinite(curQuantity) && curQuantity > 0) session.lastQuantity = curQuantity;
+        if (Number.isFinite(curQuantity) && curQuantity > 0) {
+          session.lastQuantity = curQuantity;
+          session.quantityBlankSince = 0;
+        }
+
+        // ⬛ Bloco: evita interpretar um campo de quantidade temporariamente vazio como confirmação do item.
+        // Enquanto o usuário edita/confirma a quantidade, a automação aguarda sem limite de tempo.
+        const quantityIsBeingEdited = d.activeElement === qty;
+        if (!(curQuantity > 0) && quantityIsBeingEdited) {
+          session.quantityBlankSince = 0;
+        } else if (!(curQuantity > 0) && session.lastQuantity > 0) {
+          if (!session.quantityBlankSince) session.quantityBlankSince = Date.now();
+        } else {
+          session.quantityBlankSince = 0;
+        }
+
+        const quantityWasClearedAfterConfirmation =
+          session.lastLiquid > 0 &&
+          session.lastQuantity > 0 &&
+          session.quantityBlankSince > 0 &&
+          Date.now() - session.quantityBlankSince >= 2500;
 
         const itemAdvanced = session.lastProduct && (
           (curProduct && curProduct !== session.lastProduct) ||
-          (session.lastLiquid > 0 && session.lastQuantity > 0 && !(curQuantity > 0))
+          quantityWasClearedAfterConfirmation
         );
         if (itemAdvanced) {
           if (session.lastLiquid > 0) session.accumulated = Math.min(session.target, session.accumulated + session.lastLiquid);
           session.lastLiquid = 0;
           session.lastQuantity = 0;
+          session.quantityBlankSince = 0;
           session.lastProduct = curProduct;
           delete qty.dataset.chRemainderFilled;
 
@@ -736,21 +799,33 @@
 
         const isFinalAutomaticProduct = curProduct && !session.pendingProducts.length && automaticProducts.includes(curProduct);
         if (session.accumulated > 0 && isFinalAutomaticProduct) {
-          const remaining = session.target - session.accumulated;
+          const remaining = Math.round((session.target - session.accumulated) * 100) / 100;
           const unitN = coefficientForProduct(curProduct) || parseMoney(unit.value);
           if (remaining > 0.009 && unitN > 0 && !qty.dataset.chRemainderFilled) {
-            setNativeValue(qty, remaining / unitN);
             qty.dataset.chRemainderFilled = '1';
-            status(`Produto ${curProduct}: quantidade calculada para completar o saldo de ${money(remaining)}.`, 'ok');
+            session.adjusting = true;
+            try {
+              const result = await applyExactItemTotal(remaining, unit, qty, liq, unitN);
+              status(`Produto ${curProduct}: quantidade ${result.quantity.toFixed(3)} ajustada para completar o saldo de ${money(remaining)}${result.discount > 0 ? ` com desconto de ${money(result.discount)}` : ''}.`, 'ok');
+            } catch (error) {
+              delete qty.dataset.chRemainderFilled;
+              status(`Não foi possível completar o saldo de ${money(remaining)} pela quantidade: ${error.message}`, 'warn');
+              return;
+            } finally {
+              session.adjusting = false;
+            }
           }
           const current = parseMoney(liq.value);
           if (Number.isFinite(current) && Math.abs(session.accumulated + current - session.target) <= 0.01) {
             clearInterval(session.timer);
             state.multiSession = null;
+            restorePanelAfterFill();
             status(`Total dos itens conferido: ${money(session.target)}. Continue o fechamento da DAV.`, 'ok');
           }
         }
-      } catch (_) {}
+      } catch (error) {
+        console.warn('[Calebe Helper] Acompanhamento dos itens aguardando a confirmação do lançamento:', error);
+      }
     }, 250);
   }
 
@@ -808,7 +883,9 @@
       return;
     }
 
-    state.busy = true; renderRows();
+    state.busy = true;
+    renderRows();
+    minimizePanelForFill();
     try {
       console.log('[FLUXO PREENCHER] Preencher acionado.');
       status(`Linha ${index + 1}: criando nova DAV...`);
@@ -842,7 +919,9 @@
     } catch (e) {
       console.error('[Calebe Helper]', e);
     } finally {
-      state.busy = false; renderRows();
+      state.busy = false;
+      renderRows();
+      if (!state.multiSession) restorePanelAfterFill();
     }
   }
 
@@ -1207,6 +1286,23 @@
         root.style.display = 'none';
       }
     }, 180);
+  }
+
+  function minimizePanelForFill() {
+    if (root.classList.contains('ch-collapsed')) return;
+    autoMinimizedPanel = true;
+    const right = root.getBoundingClientRect().right;
+    root.classList.add('ch-collapsed');
+    root.style.left = `${Math.max(0, right - root.getBoundingClientRect().width)}px`;
+  }
+
+  function restorePanelAfterFill() {
+    if (!autoMinimizedPanel) return;
+    autoMinimizedPanel = false;
+    const right = root.getBoundingClientRect().right;
+    root.classList.remove('ch-collapsed');
+    root.style.left = `${Math.max(0, right - root.getBoundingClientRect().width)}px`;
+    root.classList.remove('ch-unfocused');
   }
 
   $('#ch-close').addEventListener('click', hidePanel);

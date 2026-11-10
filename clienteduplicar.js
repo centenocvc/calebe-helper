@@ -11,6 +11,8 @@
   const PENDING_DAV_AFTER_SAVE_KEY = 'calebeHelperPendingDavAfterClientSaveV1';
   const SAVE_DAV_GROUP_CLASS = 'calebe-helper-salvar-dav-grupo';
   const LOG = '[Calebe Duplicar]';
+  const PENDING_DUPLICATE_KEY = 'calebeHelperPendingDuplicateV2';
+  let duplicateRequestBusy = false;
 
   let observedFrame = null;
   let observedFrameDocument = null;
@@ -49,7 +51,7 @@
   function clearFlow() {
     try {
       getStorage().removeItem(FLOW_KEY);
-    } catch (_) {}
+    } catch (_) { }
     flowBusy = false;
   }
 
@@ -76,7 +78,7 @@
   function removeStorageKey(key) {
     try {
       getStorage().removeItem(key);
-    } catch (_) {}
+    } catch (_) { }
   }
 
   function rememberDuplicatedClient(id, editUrl = '') {
@@ -431,21 +433,6 @@
     return new Parser().parseFromString(html, 'text/html');
   }
 
-  function extractEditLinks(doc, baseUrl) {
-    const result = new Map();
-    const links = doc.querySelectorAll('a[href*="clca01_form.php?acao=editar&id="]');
-
-    for (const link of links) {
-      try {
-        const url = new URL(link.getAttribute('href'), baseUrl);
-        const id = String(url.searchParams.get('id') || '').trim();
-        if (/^\d+$/.test(id)) result.set(id, url.href);
-      } catch (_) {}
-    }
-
-    return result;
-  }
-
   function findClientListUrl(doc) {
     const exit = [...doc.querySelectorAll('a[href*="clca01.php"]')]
       .find(a => /Sair/i.test(a.textContent || ''));
@@ -511,11 +498,228 @@
     return data;
   }
 
+  const DUPLICATE_ADDRESS_FIELDS = [
+    'ClienteCep', 'ClienteLogradouro', 'ClienteNumero', 'ClienteComplemento',
+    'ClienteBairro', 'ClienteMunicipio', 'ClienteUf'
+  ];
+
+  function normalizeDuplicateText(value) {
+    return String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ').trim().toUpperCase();
+  }
+
+  function duplicateIdentity(row) {
+    return {
+      document: String(row.ClienteCGC || '').replace(/\D/g, ''),
+      address: DUPLICATE_ADDRESS_FIELDS.map(key => normalizeDuplicateText(row[key]))
+    };
+  }
+
+  function sameDuplicateIdentity(row, identity) {
+    const candidate = duplicateIdentity(row);
+    return Boolean(identity.document) && candidate.document === identity.document &&
+      candidate.address.every((value, index) => value === identity.address[index]);
+  }
+
+  function duplicateEndpoint(doc) {
+    const url = new URL('clca01.php', doc.location.href);
+    const chave = doc.querySelector('input[name="chave"]')?.value ||
+      new URL(doc.location.href).searchParams.get('chave');
+    if (!chave) throw new Error('Chave da sessão não encontrada.');
+    url.searchParams.set('chave', chave);
+    return url;
+  }
+
+  async function queryDuplicateClients(doc, field, term, page = 1) {
+    const url = duplicateEndpoint(doc);
+    url.searchParams.set('campo', field);
+    url.searchParams.set('q', term);
+    url.searchParams.set('p', String(page));
+    url.searchParams.set('fmt', 'json');
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const response = await (doc.defaultView || window).fetch(url.href, {
+          credentials: 'same-origin', cache: 'no-store'
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (!Array.isArray(data.rows) || !Number.isFinite(Number(data.total))) {
+          throw new Error('O SATGO não retornou a lista JSON de clientes esperada.');
+        }
+        return data;
+      } catch (error) {
+        if (attempt === 3) throw new Error(`Falha na consulta do código ${term}: ${error.message}`);
+        await new Promise(resolve => setTimeout(resolve, attempt * 400));
+      }
+    }
+  }
+
+  /* =========================================================
+     BUSCA SUPREMA POR SALTO EXPONENCIAL + BUSCA BINÁRIA (COM STORAGE)
+     ========================================================= */
+  async function findHighestAvailableClient(doc) {
+    // 1. LER DO STORAGE: Tenta buscar o último recorde salvo na memória.
+    // Se não houver nada gravado ainda, usa o 708 como ponto de partida inicial seguro.
+    const storedHighest = readJsonStorage('calebeHelperMaiorCodigoAbsoluto');
+    const knownHighest = storedHighest && !isNaN(storedHighest) ? Number(storedHighest) : 708;
+    
+    const emptyLimit = 30;    // Limite de segurança contra buracos falsos
+    
+    console.info(LOG, `Iniciando Busca Exponencial Suprema a partir do Storage: ${knownHighest}.`);
+
+    let step = 1;
+    let lastFoundOcupado = knownHighest;
+    let highestRow = null;
+    let currentCheck = knownHighest + step;
+
+    // FASE 1: Salto Exponencial (Multiplica o passo por 2 a cada acerto)
+    while (true) {
+      const result = await queryDuplicateClients(doc, 'ClienteCodigo', String(currentCheck));
+      const row = result.rows.find(item => Number(item.ClienteCodigo) === currentCheck);
+
+      if (row) {
+        lastFoundOcupado = currentCheck;
+        highestRow = row;
+        
+        console.info(LOG, `ID ${currentCheck} ocupado. Dobrando o passo de ${step} para ${step * 2}.`);
+        step *= 2; // Dobra o tamanho do salto
+        currentCheck = lastFoundOcupado + step;
+      } else {
+        // Encontramos um código vago! O teto está entre o último ocupado e este chute atual
+        console.info(LOG, `ID ${currentCheck} está vago. Teto encontrado! Refinando intervalo.`);
+        break;
+      }
+    }
+
+    // FASE 2: Busca Binária no intervalo delimitado (Corta pela metade a cada tentativa)
+    let low = lastFoundOcupado;
+    let high = currentCheck;
+
+    console.info(LOG, `Iniciando Busca Binária entre os IDs ${low} e ${high}.`);
+
+    while (low <= high) {
+      let mid = Math.floor((low + high) / 2);
+      
+      // Evita testar novamente os extremos já conhecidos para economizar requisições
+      if (mid === low || mid === high) {
+        break;
+      }
+
+      const resultMid = await queryDuplicateClients(doc, 'ClienteCodigo', String(mid));
+      const rowMid = resultMid.rows.find(item => Number(item.ClienteCodigo) === mid);
+
+      if (rowMid) {
+        // Se o meio está ocupado, o maior absoluto está na metade superior
+        highestRow = rowMid;
+        lastFoundOcupado = mid;
+        low = mid; 
+      } else {
+        // Se o meio está vago, o maior absoluto está na metade inferior
+        high = mid;
+      }
+    }
+
+    // FASE 3: Varredura de segurança contra pequenos buracos falsos no fim da linha
+    console.info(LOG, `Aplicando margem de segurança linear a partir de ${lastFoundOcupado}.`);
+    let linearCheck = lastFoundOcupado + 1;
+    let consecutiveEmpty = 0;
+
+    while (consecutiveEmpty < emptyLimit) {
+      const resultLinear = await queryDuplicateClients(doc, 'ClienteCodigo', String(linearCheck));
+      const rowLinear = resultLinear.rows.find(item => Number(item.ClienteCodigo) === linearCheck);
+
+      if (rowLinear) {
+        highestRow = rowLinear;
+        lastFoundOcupado = linearCheck;
+        consecutiveEmpty = 0; // Zera se achar um ID isolado mais alto
+      } else {
+        consecutiveEmpty++;
+      }
+      linearCheck++;
+    }
+
+    if (highestRow) {
+      console.info(LOG, `[SUCESSO] Maior código absoluto cravado: ${highestRow.ClienteCodigo}`);
+      
+      // 2. SALVAR NO STORAGE: Grava o novo maior ID absoluto encontrado.
+      // Na próxima vez que você duplicar um cliente, ele não começará do 708, mas sim deste novo número!
+      writeJsonStorage('calebeHelperMaiorCodigoAbsoluto', Number(highestRow.ClienteCodigo));
+      
+      return highestRow;
+    }
+
+    throw new Error('Falha crítica no algoritmo exponencial ao determinar o teto do cadastro.');
+  }
+
+
+
+  async function duplicateAndResolve(doc, originalId, data) {
+    if (duplicateRequestBusy) throw new Error('Já existe uma duplicação em andamento.');
+    duplicateRequestBusy = true;
+    try {
+      const pendingKey = `${PENDING_DUPLICATE_KEY}:${String(originalId)}`;
+      // Cada novo clique do usuário inicia outra operação, descartando
+      // a pendência local da tentativa anterior. O bloqueio em memória acima
+      // continua impedindo dois pedidos simultâneos por clique duplo.
+      removeStorageKey(pendingKey);
+      removeStorageKey(PENDING_DUPLICATE_KEY);
+      const pending = { originalId: String(originalId), confirmed: false, startedAt: Date.now(), mode: 'highest-code' };
+      writeJsonStorage(pendingKey, pending);
+      console.info(LOG, `Solicitando ao SATGO a duplicação do cliente ${originalId}.`);
+      const response = await (doc.defaultView || window).fetch(duplicateEndpoint(doc).href, {
+        method: 'POST', body: data, credentials: 'same-origin'
+      });
+      const text = await response.text();
+      let payload = null;
+      try { payload = JSON.parse(text); } catch (_) { }
+      const afterDoc = payload ? null : parseHtml(doc.defaultView, text);
+      pending.confirmed = response.ok && (
+        /Registro duplicado com sucesso/i.test(afterDoc?.body?.textContent || '') ||
+        payload?.success === true || payload?.sucesso === true
+      );
+      // Guarda o diagnóstico desta tentativa. Um novo clique explícito
+      // descarta esse registro e envia uma nova solicitação.
+      pending.diagnostic = {
+        status: response.status,
+        tipo: payload ? 'json' : 'html',
+        camposJSON: payload ? Object.keys(payload) : [],
+        caminhoFinal: new URL(response.url || duplicateEndpoint(doc).href).pathname,
+        alertas: [...(afterDoc?.querySelectorAll('.alert') || [])]
+          .map(el => String(el.textContent || '').trim().replace(/(chave|token)=[^\s&]+/gi, '$1=[OCULTO]').slice(0, 500)),
+        formularioEdicao: Boolean(afterDoc?.querySelector('#formClifor'))
+      };
+      writeJsonStorage(pendingKey, pending);
+      if (!pending.confirmed) {
+        throw new Error('O SATGO não confirmou a operação na resposta recebida. O pedido foi guardado e não será reenviado automaticamente.');
+      }
+      console.info(LOG, 'Duplicação confirmada. Buscando o maior código disponível.');
+      const created = await findHighestAvailableClient(doc);
+      const newId = String(created.ClienteCodigo);
+      console.info(LOG, `Maior código localizado: ${newId}. Conferindo CPF/CNPJ e endereço.`);
+      const originalResult = await queryDuplicateClients(doc, 'ClienteCodigo', String(originalId));
+      const original = originalResult.rows.find(row => String(row.ClienteCodigo) === String(originalId));
+      if (newId === String(originalId) || !original || !normalizeDuplicateText(original.ClienteLogradouro) ||
+        !sameDuplicateIdentity(created, duplicateIdentity(original))) {
+        throw new Error(`O maior código (${newId}) não corresponde ao CPF/CNPJ e endereço do cliente ${originalId}. A edição não foi aberta e a duplicação não foi repetida.`);
+      }
+      pending.newId = newId;
+
+      const editUrl = new URL('clca01_form.php', duplicateEndpoint(doc));
+      editUrl.searchParams.set('acao', 'editar');
+      editUrl.searchParams.set('id', pending.newId);
+      editUrl.searchParams.set('chave', duplicateEndpoint(doc).searchParams.get('chave'));
+      rememberDuplicatedClient(pending.newId, editUrl.href);
+      removeStorageKey(pendingKey);
+      return { newId: pending.newId, editUrl: editUrl.href };
+    } finally {
+      duplicateRequestBusy = false;
+    }
+  }
+
   async function duplicateFromListAndOpen(button) {
     if (button.classList.contains('calebe-helper-duplicando')) return;
 
     const doc = button.ownerDocument;
-    const win = doc.defaultView || window;
     const client = parseNativeDuplicateButton(button);
     if (!client) throw new Error('Não foi possível identificar o cliente do botão Duplicar.');
 
@@ -524,48 +728,8 @@
     beginOverlaySuppression('duplicate');
 
     try {
-      const baseUrl = doc.location.href;
-      const beforeLinks = extractEditLinks(doc, baseUrl);
-      const endpoint = new URL('clca01.php', baseUrl);
       const data = buildDuplicateFormDataFromList(doc, client.id);
-
-      console.info(LOG, `Duplicando cliente ${client.id} pela listagem.`);
-      const response = await win.fetch(endpoint.href, {
-        method: 'POST',
-        body: data,
-        credentials: 'same-origin'
-      });
-
-      if (!response.ok) {
-        throw new Error(`Falha na duplicação (HTTP ${response.status}).`);
-      }
-
-      const html = await response.text();
-      const afterDoc = parseHtml(win, html);
-      const bodyText = String(afterDoc.body?.textContent || '');
-
-      if (!/Registro duplicado com sucesso/i.test(bodyText)) {
-        const alertText = [...afterDoc.querySelectorAll('.alert')]
-          .map(el => String(el.textContent || '').trim())
-          .filter(Boolean)
-          .join(' | ');
-        throw new Error(alertText || 'O servidor não confirmou a duplicação do cliente.');
-      }
-
-      const afterLinks = extractEditLinks(afterDoc, response.url || endpoint.href);
-      const newIds = [...afterLinks.keys()].filter(id => !beforeLinks.has(id));
-
-      if (newIds.length !== 1) {
-        throw new Error(
-          `Não foi possível identificar com segurança o novo cliente. IDs novos: ${newIds.join(', ') || 'nenhum'}.`
-        );
-      }
-
-      const newId = newIds[0];
-      const editUrl = afterLinks.get(newId);
-      if (!editUrl) throw new Error(`Link de edição do cliente ${newId} não encontrado.`);
-
-      rememberDuplicatedClient(newId, editUrl);
+      const { newId, editUrl } = await duplicateAndResolve(doc, client.id, data);
       console.info(LOG, `Cliente ${client.id} duplicado como ${newId}; abrindo edição.`);
       navigateFrame(editUrl);
       endOverlaySuppression('duplicate');
@@ -591,7 +755,7 @@
         event.stopImmediatePropagation();
 
         duplicateFromListAndOpen(button).catch(error => {
-          console.error(LOG, 'Falha ao duplicar pela listagem.', error);
+          console.error(LOG, 'Falha ao concluir a duplicação pela listagem. Consulte a etapa informada abaixo.', error);
         });
       }, true);
     }
@@ -942,18 +1106,6 @@
     const chave = String(form?.querySelector('input[name="chave"]')?.value || '').trim();
     if (!chave) throw new Error('Chave da sessão não encontrada no formulário do cliente.');
 
-    const listUrl = findClientListUrl(doc);
-    if (!listUrl) throw new Error('Não foi possível determinar a URL nativa da listagem de clientes.');
-
-    console.info(LOG, `Lendo listagem antes de duplicar o cliente ${flow.originalId}.`);
-    const beforeResponse = await win.fetch(listUrl, { method: 'GET', credentials: 'same-origin' });
-    if (!beforeResponse.ok) throw new Error(`Falha ao ler listagem antes da duplicação (HTTP ${beforeResponse.status}).`);
-
-    const beforeHtml = await beforeResponse.text();
-    const beforeDoc = parseHtml(win, beforeHtml);
-    const beforeLinks = extractEditLinks(beforeDoc, listUrl);
-
-    const endpoint = new URL('clca01.php', listUrl);
     const FormDataCtor = win.FormData || FormData;
     const data = new FormDataCtor();
     data.set('acao', 'duplicar');
@@ -961,46 +1113,10 @@
     data.set('chave', chave);
 
     for (const name of ['q', 'campo', 'cred', 'pessoa', 'tipo', 'uni', 'p']) {
-      copyFilterValue(beforeDoc, data, name);
+      copyFilterValue(doc, data, name);
     }
 
-    console.info(LOG, `Duplicando cliente ${flow.originalId} sem abrir o modal nativo.`);
-    const response = await win.fetch(endpoint.href, {
-      method: 'POST',
-      body: data,
-      credentials: 'same-origin'
-    });
-
-    if (!response.ok) throw new Error(`Falha na duplicação (HTTP ${response.status}).`);
-
-    const html = await response.text();
-    const afterDoc = parseHtml(win, html);
-
-    const successText = String(afterDoc.body?.textContent || '');
-    if (!/Registro duplicado com sucesso/i.test(successText)) {
-      const alertText = [...afterDoc.querySelectorAll('.alert')]
-        .map(el => String(el.textContent || '').trim())
-        .filter(Boolean)
-        .join(' | ');
-      throw new Error(alertText || 'O servidor não confirmou a duplicação do cliente.');
-    }
-
-    const afterLinks = extractEditLinks(afterDoc, response.url || endpoint.href);
-    const newIds = [...afterLinks.keys()].filter(id => !beforeLinks.has(id));
-
-    if (newIds.length !== 1) {
-      throw new Error(
-        `Não foi possível identificar com segurança o novo cliente. IDs novos encontrados: ${newIds.join(', ') || 'nenhum'}.`
-      );
-    }
-
-    const newId = newIds[0];
-    const editUrl = afterLinks.get(newId);
-    if (!editUrl) throw new Error(`Link de edição do novo cliente ${newId} não encontrado.`);
-
-    rememberDuplicatedClient(newId, editUrl);
-    console.info(LOG, `Cliente ${flow.originalId} duplicado como ${newId}.`);
-    return { newId, editUrl };
+    return duplicateAndResolve(doc, flow.originalId, data);
   }
 
   /* =========================================================

@@ -17,6 +17,10 @@
   const boundFrames = new WeakSet();
   let stopped = false;
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  function modalOwnsDav() {
+    try { return window.top.document.documentElement.dataset.calebeModalDavActive === '1'; }
+    catch (_) { return false; }
+  }
 
   function number(value) {
     let text = String(value ?? '').trim().replace(/R\$|\s/g, '');
@@ -203,7 +207,7 @@
       }
     `;
     (doc.head || doc.documentElement).appendChild(style);
-    const state = { total: '', serial: 0, busy: false, pending: false, applied: false, signature: '', autoDone: '', autoFingerprint: '', autoSince: 0, multiple: false, multi: null, groups: [], disposed: false };
+    const state = { total: '', serial: 0, busy: false, pending: false, applied: false, signature: '', autoDone: '', autoFingerprint: '', autoSince: 0, multiple: false, multi: null, groups: [], disposed: false, modalWasActive: false };
 
     function message(text, error = false) {
       for (const group of state.groups) {
@@ -230,7 +234,7 @@
       return Boolean(String(el && ('value' in el ? el.value : el.textContent) || '').trim());
     }
     async function apply(target = null) {
-      if (state.disposed) return;
+      if (state.disposed || modalOwnsDav()) return;
       if (state.busy) { state.pending = true; return; }
       const code = productCode();
       if (!['21', '22'].includes(code)) return message('O cálculo está disponível somente para os produtos 21 e 22.', true);
@@ -253,7 +257,7 @@
       const qty = extraDecimals ? Math.ceil(raw * 1000) / 1000 : raw;
       const discount = Math.max(0, qty * coefficient - total);
       const token = ++state.serial;
-      const valid = () => !state.disposed && token === state.serial && f.code.isConnected && productCode() === code;
+      const valid = () => !state.disposed && !modalOwnsDav() && token === state.serial && f.code.isConnected && productCode() === code;
       state.autoDone = code;
       state.busy = true;
       try {
@@ -331,6 +335,7 @@
     }
 
     function confirmValue() {
+      if (modalOwnsDav()) return;
       if (state.multiple) {
         if (state.multi) { state.multi.paused = false; state.multi.fillKey = ''; }
         else startMultiple();
@@ -376,6 +381,7 @@
       } finally { session.switching = false; }
     }
     function tickMultiple() {
+      if (modalOwnsDav()) return;
       const m = state.multi;
       if (!m || m.paused || m.done || m.switching || state.busy) return;
       const target = number(state.total);
@@ -551,6 +557,24 @@
     function tick() {
       if (state.disposed) return;
       place();
+      if (modalOwnsDav()) {
+        if (!state.modalWasActive) {
+          state.modalWasActive = true;
+          ++state.serial;
+          state.pending = false;
+          state.multi = null;
+          state.total = '';
+          state.applied = false;
+          state.autoDone = productCode();
+          sync();
+          message('Preenchimento do modal em andamento: controles fixos sem efeito nesta DAV.');
+        }
+        return;
+      }
+      if (state.modalWasActive) {
+        state.modalWasActive = false;
+        state.autoDone = productCode();
+      }
       const code = productCode();
       const signature = `${code}|${loaded()}`;
       if (signature !== state.signature) {

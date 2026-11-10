@@ -5,6 +5,12 @@
 
   const LOG = '[Calebe Helper · Campos Cliente]';
   const DEFAULT_DDD = '62';
+  const EMPTY_LANDLINE = '(00) 0000-0000';
+  const EMPTY_MOBILE = '(00) 0 0000-0000';
+  const EMAIL_SUGGESTIONS = [
+    'comprasmoraisengenharia@gmail.com',
+    'compras@isconstrutora.com'
+  ];
   const WIRED_ATTR = 'calebeHelperCamposWired';
   const BIRTHDAY_HANDLED_ATTR = 'calebeHelperBirthdayHandled';
   const sintegraRequests = new Map();
@@ -241,6 +247,25 @@
     normalize();
   }
 
+  function wireEmailSuggestions(doc) {
+    const input = doc.querySelector('[name="ClienteEmail"]');
+    if (!input) return;
+    const listId = 'calebe-helper-clientes-email-sugestoes';
+    let list = doc.getElementById(listId);
+    if (!list) {
+      list = doc.createElement('datalist');
+      list.id = listId;
+      for (const email of EMAIL_SUGGESTIONS) {
+        const option = doc.createElement('option');
+        option.value = email;
+        list.appendChild(option);
+      }
+      doc.body.appendChild(list);
+    }
+    input.setAttribute('list', listId);
+    input.setAttribute('autocomplete', 'off');
+  }
+
   /* =========================================================
      ENDEREÇO — EVITA TEXTO INTEIRO EM MAIÚSCULAS
      ========================================================= */
@@ -402,15 +427,22 @@
     };
 
     const onBlur = () => {
+      if (!onlyDigits(el.value)) {
+        el.value = kind === 'mobile' ? EMPTY_MOBILE : (kind === 'fax' ? '' : EMPTY_LANDLINE);
+        return;
+      }
       const next = completeFormatter(el.value);
       if (next !== el.value) el.value = next;
     };
 
     el.addEventListener('input', onInput);
+    el.addEventListener('focus', () => {
+      if (el.value === EMPTY_LANDLINE || el.value === EMPTY_MOBILE) el.select();
+    });
     el.addEventListener('paste', () => setTimeout(onBlur, 0));
     el.addEventListener('blur', onBlur);
 
-    if (el.value) onBlur();
+    onBlur();
   }
 
   /* =========================================================
@@ -423,18 +455,18 @@
       .replace(/[\u0300-\u036f]/g, '')
       .toLocaleLowerCase('pt-BR');
 
-    return normalized.includes('anivers') &&
+    return normalized.includes('nenhum aniversariante informado') || (normalized.includes('anivers') &&
       (
         normalized.includes('nao existe') ||
         normalized.includes('nao ha') ||
         normalized.includes('sem inform') ||
         normalized.includes('nenhuma inform') ||
         normalized.includes('informacao')
-      );
+      ));
   }
 
-  function suppressBirthdayWarning(doc) {
-    const ok = doc.getElementById('calConfirmOk');
+  function suppressClientWarnings(doc) {
+    const ok = doc.getElementById('btnAlertaOk') || doc.getElementById('calConfirmOk');
     if (!ok || ok.dataset[BIRTHDAY_HANDLED_ATTR]) return false;
 
     const candidates = [
@@ -444,7 +476,10 @@
       ok.parentElement
     ].filter(Boolean);
 
-    const dialog = candidates.find(el => isBirthdayWarningText(el.textContent));
+    const dialog = candidates.find(el => {
+      const text = String(el.textContent || '');
+      return isBirthdayWarningText(text) || /possível cadastro duplicado/i.test(text);
+    });
     if (!dialog) return false;
 
     ok.dataset[BIRTHDAY_HANDLED_ATTR] = '1';
@@ -470,7 +505,7 @@
     doc.documentElement.dataset.calebeHelperBirthdayObserver = '1';
 
     const observer = new MutationObserver(() => {
-      suppressBirthdayWarning(doc);
+      suppressClientWarnings(doc);
     });
 
     observer.observe(doc.documentElement, {
@@ -480,7 +515,7 @@
       attributeFilter: ['class', 'style']
     });
 
-    suppressBirthdayWarning(doc);
+    suppressClientWarnings(doc);
   }
 
   /* =========================================================
@@ -512,11 +547,12 @@
     }
 
     const mobile = doc.querySelector('[name="ClienteCelular"]');
-    if (mobile?.value) mobile.value = formatMobileComplete(mobile.value);
+    if (mobile) mobile.value = onlyDigits(mobile.value) ? formatMobileComplete(mobile.value) : EMPTY_MOBILE;
 
     for (const name of ['ClienteFone1', 'ClienteFax']) {
       const el = doc.querySelector(`[name="${name}"]`);
-      if (el?.value) el.value = formatLandlineComplete(el.value);
+      if (el) el.value = onlyDigits(el.value) ? formatLandlineComplete(el.value) :
+        (name === 'ClienteFone1' ? EMPTY_LANDLINE : '');
     }
 
     for (const name of ['ClienteLogradouro', 'ClienteComplemento', 'ClienteBairro']) {
@@ -536,12 +572,13 @@
     wireNumericMask(doc.getElementById('ClienteIM'), formatGoianiaIM, 7, '0000000');
     wireUppercaseField(doc.querySelector('[name="ClienteRazaoSocial"]'));
     wireLowercaseField(doc.querySelector('[name="ClienteEmail"]'));
+    wireEmailSuggestions(doc);
     wireLowercaseField(doc.querySelector('[name="ClienteSite"]'));
     wireSintegraLookup(doc);
 
     wirePhone(doc.querySelector('[name="ClienteFone1"]'), 'landline');
     wirePhone(doc.querySelector('[name="ClienteCelular"]'), 'mobile');
-    wirePhone(doc.querySelector('[name="ClienteFax"]'), 'landline');
+    wirePhone(doc.querySelector('[name="ClienteFax"]'), 'fax');
 
     wireAddressField(doc.querySelector('[name="ClienteLogradouro"]'));
     wireAddressField(doc.querySelector('[name="ClienteComplemento"]'));
@@ -550,7 +587,7 @@
     form.addEventListener('submit', () => {
       normalizeBeforeSubmit(doc);
       // O aviso pode ser criado logo após a tentativa de submit.
-      setTimeout(() => suppressBirthdayWarning(doc), 0);
+      setTimeout(() => suppressClientWarnings(doc), 0);
     }, true);
 
     installBirthdayObserver(doc);

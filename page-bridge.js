@@ -19,6 +19,16 @@
       try {
         const init = args[1] || {};
         const body = init.body;
+        // O fechamento é confirmado pela mesma resposta que o SATGO usa antes de abrir o PDF nativo.
+        if (body instanceof FormData && body.get('acao') === 'fechar_dav') {
+          try {
+            const data = await response.clone().json();
+            if (!data?.erro) {
+              const davId = Number(new URLSearchParams(window.location.search).get('id')) || null;
+              emit('dav-close-confirmed', { davId, ok: true });
+            }
+          } catch (_) {}
+        }
         if (body instanceof FormData && body.get('acao') === 'get_cliente_por_codigo') {
           response.clone().json().then(row => {
             if (row && row.ClienteCodigo) {
@@ -50,6 +60,36 @@
   document.addEventListener('calebe-helper:command', async event => {
     const d = event.detail || {};
     try {
+      if (d.action === 'reserve-thermal-print-window') {
+        const thermalWindowName = 'calebeHelperThermalPrint';
+        const popup = window.open('about:blank', thermalWindowName);
+        if (!popup) throw new Error('O navegador bloqueou a janela reservada para a impressão térmica.');
+        try {
+          popup.document.title = 'Preparando impressão térmica...';
+          popup.document.body.textContent = 'Aguardando a confirmação do fechamento do DAV.';
+        } catch (_) {}
+        emit('thermal-window-reserved', { ok: true });
+        return;
+      }
+      if (d.action === 'print-thermal-dav') {
+        const davId = Number(d.davId);
+        if (!Number.isInteger(davId) || davId <= 0) throw new Error('Número do DAV inválido.');
+        if (typeof window.abrirEspelhoDavTermico !== 'function') {
+          throw new Error('A função abrirEspelhoDavTermico não está disponível neste iframe.');
+        }
+        const originalOpen = window.open;
+        try {
+          window.open = function (url, target, features) {
+            const requestedTarget = !target || target === '_blank' ? (d.windowName || 'calebeHelperThermalPrint') : target;
+            return originalOpen.call(window, url, requestedTarget, features);
+          };
+          window.abrirEspelhoDavTermico(davId);
+        } finally {
+          window.open = originalOpen;
+        }
+        emit('thermal-print-result', { id: d.requestId, ok: true, davId });
+        return;
+      }
       if (d.action === 'lookup-client') {
         const code = String(d.code || '').trim();
         if (!code) throw new Error('Código do cliente vazio.');
@@ -136,6 +176,9 @@
         return;
       }
     } catch (err) {
+      if (d.action === 'print-thermal-dav') {
+        emit('thermal-print-result', { id: d.requestId, ok: false, error: String(err?.message || err) });
+      }
       emit('command-result', { id: d.id, ok: false, error: String(err?.message || err) });
     }
   });

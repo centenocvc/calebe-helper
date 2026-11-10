@@ -36,7 +36,7 @@
 
   let currentDocument = null;
   let currentController = null;
-  let wiredFrame = null;
+  const wiredFrames = new WeakSet();
   let observedFrameDocument = null;
   let frameDocumentObserver = null;
 
@@ -323,6 +323,13 @@
       positionHistoryDropdown();
     }
 
+    function documentSearchTerms(original, digits) {
+      const candidates = [String(original || '').trim(), digits];
+      if (digits.length === 14) candidates.push(digits.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5'));
+      if (digits.length === 11) candidates.push(digits.replace(/^(\d{3})(\d{3})(\d{3})(\d{2})$/, '$1.$2.$3-$4'));
+      return [...new Set(candidates.filter(Boolean))];
+    }
+
     function classify(term, preferredMethod) {
       const trimmed = String(term || '').trim();
       if (!trimmed) return null;
@@ -333,12 +340,12 @@
           return { criterion: 'codigo', nativeFields: ['ClienteCodigo'], nativeValue: 'ClienteCodigo', term: trimmed, historyTerm: trimmed };
         }
         if (digits.length === 11 || digits.length === 14) {
-          return { criterion: 'documento', nativeFields: ['ClienteCGC'], nativeValue: 'ClienteCGC', term: digits, historyTerm: trimmed };
+          return { criterion: 'documento', nativeFields: ['ClienteCGC'], nativeValue: 'ClienteCGC', term: digits, searchTerms: documentSearchTerms(trimmed, digits), historyTerm: trimmed };
         }
         return null;
       }
       if (isDocumentPattern && (digits.length === 11 || digits.length === 14)) {
-        return { criterion: 'documento', nativeFields: ['ClienteCGC'], nativeValue: 'ClienteCGC', term: digits, historyTerm: trimmed };
+        return { criterion: 'documento', nativeFields: ['ClienteCGC'], nativeValue: 'ClienteCGC', term: digits, searchTerms: documentSearchTerms(trimmed, digits), historyTerm: trimmed };
       }
       const group = SEARCH_GROUPS[preferredMethod];
       return group ? { ...group, term: trimmed, historyTerm: trimmed } : null;
@@ -349,7 +356,8 @@
       if (item.criterion === 'municipio') return { ...SEARCH_GROUPS.location, term: item.term, historyTerm: item.term };
       if (item.criterion === 'codigo') return { criterion: 'codigo', nativeFields: ['ClienteCodigo'], nativeValue: 'ClienteCodigo', term: item.term, historyTerm: item.term };
       if (item.criterion === 'documento') {
-        return { criterion: 'documento', nativeFields: ['ClienteCGC'], nativeValue: 'ClienteCGC', term: item.term.replace(/\D/g, ''), historyTerm: item.term };
+        const digits = item.term.replace(/\D/g, '');
+        return { criterion: 'documento', nativeFields: ['ClienteCGC'], nativeValue: 'ClienteCGC', term: digits, searchTerms: documentSearchTerms(item.term, digits), historyTerm: item.term };
       }
       return null;
     }
@@ -376,11 +384,70 @@
       const html = await response.text();
       const parsedDocument = new DOMParser().parseFromString(html, 'text/html');
       const rows = [...parsedDocument.querySelectorAll('#tblClientes tbody tr')];
-      const resultRows = rows.filter(row => row.querySelectorAll('td').length === 8);
+      const resultRows = rows.filter(row => row.querySelectorAll('td').length >= 7);
       const totalText = parsedDocument.getElementById('lblEncontrados')?.textContent || '';
-      const total = Number(totalText.replace(/\D/g, '')) || resultRows.length;
+      const totalMatch = totalText.match(/Encontrados\s*:\s*([\d.,]+)/i);
+      const total = totalMatch ? (Number(totalMatch[1].replace(/\D/g, '')) || resultRows.length) : resultRows.length;
       const totalPag = Math.max(1, Math.ceil(total / 15));
-      return { field: nativeField, parsedDocument, rows, total, pagina: page, totalPag };
+      return { field: nativeField, term, parsedDocument, rows, total, pagina: page, totalPag };
+    }
+
+    // Algumas páginas do SATGO repetem clientes anteriores ao usar p=2, embora
+    // o contador informe que ainda existem registros. A pesquisa por parte do
+    // código permite recuperar os cadastros omitidos sem inventar resultados.
+    async function recoverMissingNameRows(source) {
+      if (source.field !== 'ClienteRazaoSocial' || source.total <= 15) {
+        return { documents: [source.parsedDocument], pagina: source.pagina };
+      }
+
+      const documents = [source.parsedDocument];
+      const seen = new Set();
+      const remember = parsedDocument => {
+        parsedDocument.querySelectorAll('#tblClientes tbody tr').forEach(row => {
+          if (row.querySelectorAll('td').length >= 7) {
+            const code = row.querySelector('td')?.textContent.match(/^\s*\d+/)?.[0]?.trim();
+            if (code) seen.add(code);
+          }
+        });
+      };
+      remember(source.parsedDocument);
+
+      for (let page = 2; page <= source.totalPag; page++) {
+        const next = await fetchSearchSource(source.field, source.term, page);
+        documents.push(next.parsedDocument);
+        remember(next.parsedDocument);
+      }
+
+      if (seen.size < source.total) {
+        const lastCode = Math.max(...[...seen].map(Number).filter(Number.isFinite));
+        const startPrefix = Math.floor(lastCode / 10);
+        const wanted = normalizeHistoryTerm(source.term);
+
+        // Limita as consultas suplementares; a correspondência é conferida
+        // na razão social devolvida pelo próprio servidor antes de exibir.
+        for (let prefix = startPrefix; prefix < startPrefix + 30 && seen.size < source.total; prefix++) {
+          const candidate = await fetchSearchSource('ClienteCodigo', String(prefix));
+          const candidateRows = candidate.parsedDocument.querySelectorAll('#tblClientes tbody tr');
+          candidateRows.forEach(row => {
+            const cells = row.querySelectorAll('td');
+            const code = cells[0]?.textContent.match(/^\s*\d+/)?.[0]?.trim();
+            const name = normalizeHistoryTerm(cells[1]?.querySelector('strong')?.textContent);
+            if (!code || cells.length < 7 || !name.includes(wanted) || seen.has(code)) {
+              row.remove();
+            } else {
+              seen.add(code);
+            }
+          });
+          if (candidate.parsedDocument.querySelector('#tblClientes tbody tr')) {
+            documents.push(candidate.parsedDocument);
+          }
+        }
+      }
+
+      if (seen.size < source.total) {
+        console.warn(`[Calebe Helper] SATGO informou ${source.total} clientes, mas entregou ${seen.size} códigos distintos para esta razão social.`);
+      }
+      return { documents, pagina: source.totalPag };
     }
 
     function resolveEffectiveNameField(socialResult, fantasyResult) {
@@ -441,10 +508,11 @@
       for (const parsedDocument of parsedDocuments) {
         for (const row of parsedDocument.querySelectorAll('#tblClientes tbody tr')) {
           const cells = row.querySelectorAll('td');
-          if (cells.length !== 8) continue;
+          if (cells.length < 7) continue;
           const clientCode = cells[0].textContent.trim();
-          if (clientCodes.has(clientCode)) continue;
-          clientCodes.add(clientCode);
+          const identity = clientCode || String(row.textContent || '').replace(/\s+/g, ' ').trim();
+          if (identity && clientCodes.has(identity)) continue;
+          if (identity) clientCodes.add(identity);
           rows.push(doc.importNode(row, true));
         }
       }
@@ -550,10 +618,10 @@
       try {
         const pendingSources = activeSearch.sources.filter(source => source.pagina < source.totalPag);
         const nextResults = await Promise.all(
-          pendingSources.map(source => fetchSearchSource(source.field, activeSearch.term, source.pagina + 1))
+          pendingSources.map(source => fetchSearchSource(source.field, source.term || activeSearch.term, source.pagina + 1))
         );
         for (const result of nextResults) {
-          const source = activeSearch.sources.find(item => item.field === result.field);
+          const source = activeSearch.sources.find(item => item.field === result.field && item.term === result.term);
           source.pagina = result.pagina;
           source.total = result.total;
           source.totalPag = result.totalPag;
@@ -605,10 +673,17 @@
       closeHistory();
 
       try {
+        const searchTerms = classification.searchTerms || [classification.term];
         const sourceResults = await Promise.all(
-          classification.nativeFields.map(nativeField => fetchSearchSource(nativeField, classification.term))
+          classification.nativeFields.flatMap(nativeField =>
+            searchTerms.map(term => fetchSearchSource(nativeField, term))
+          )
         );
-        const parsedDocuments = sourceResults.map(result => result.parsedDocument);
+        const recoveredSources = [];
+        for (const result of sourceResults) {
+          recoveredSources.push(await recoverMissingNameRows(result));
+        }
+        const parsedDocuments = recoveredSources.flatMap(source => source.documents);
         const rows = combineRows(parsedDocuments);
         const effectiveField = resolveEffectiveField(classification, sourceResults);
         activeSearch = {
@@ -616,12 +691,13 @@
           effectiveField,
           term: classification.term,
           historyTerm: classification.historyTerm,
-          sources: sourceResults.map(result => ({
+          sources: sourceResults.map((result, index) => ({
             field: result.field,
-            pagina: result.pagina,
+            term: result.term,
+            pagina: recoveredSources[index].pagina,
             total: result.total,
             totalPag: result.totalPag,
-            documents: [result.parsedDocument]
+            documents: recoveredSources[index].documents
           }))
         };
 
@@ -780,6 +856,8 @@
     if (observedFrameDocument !== doc) {
       frameDocumentObserver?.disconnect();
       currentController?.abort();
+      const previousCard = currentDocument ? findClientSearchCard(currentDocument) : null;
+      if (previousCard) delete previousCard.dataset.calebeClientSearchInstalled;
       currentController = null;
       currentDocument = null;
       observedFrameDocument = doc;
@@ -799,10 +877,12 @@
   }
 
   function processFrame() {
-    const frame = document.getElementById('mainIframe');
+    // A tela de clientes pode estar em um iframe de aba, não no #mainIframe original.
+    const frame = document.querySelector('iframe.aba-frame.ativa') ||
+      document.getElementById('mainIframe');
     if (!frame) return;
-    if (wiredFrame !== frame) {
-      wiredFrame = frame;
+    if (!wiredFrames.has(frame)) {
+      wiredFrames.add(frame);
       frame.addEventListener('load', processFrame);
     }
     try {
@@ -815,5 +895,11 @@
 
   processFrame();
   const frameObserver = new MutationObserver(processFrame);
-  frameObserver.observe(document.documentElement, { childList: true, subtree: true });
+  // A troca de aba é sinalizada pela classe ativa do iframe.
+  frameObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['class']
+  });
 })();
