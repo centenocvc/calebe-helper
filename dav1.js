@@ -60,12 +60,38 @@
     (doc.head || doc.documentElement).appendChild(style);
   }
 
+  /*   function extractDavId(row) {
+      const formatted = String(row?.textContent || '').match(/\b\d{3}-(\d{5})\b/);
+      if (formatted) return Number(formatted[1]) || null;
+      const selected = String(row?.getAttribute?.('onclick') || '').match(/selecionarLinha\s*\(\s*this\s*,\s*(\d+)/);
+      return selected ? Number(selected[1]) || null : null;
+    } */
+
+
   function extractDavId(row) {
-    const formatted = String(row?.textContent || '').match(/\b\d{3}-(\d{5})\b/);
+    const formatted = String(row?.textContent || '')
+      .match(/\b\d{3}-(\d{5,})\b/);
+
     if (formatted) return Number(formatted[1]) || null;
-    const selected = String(row?.getAttribute?.('onclick') || '').match(/selecionarLinha\s*\(\s*this\s*,\s*(\d+)/);
-    return selected ? Number(selected[1]) || null : null;
+
+    const onclicks = [
+      row?.getAttribute?.('onclick'),
+      ...[...(row?.querySelectorAll?.('[onclick]') || [])]
+        .map(element => element.getAttribute('onclick'))
+    ];
+
+    for (const onclick of onclicks) {
+      const match = String(onclick || '').match(
+        /(?:duplicarDav|abrirDav|selecionarLinha)\s*\(\s*(?:this\s*,\s*)?(\d+)/
+      );
+
+      if (match) return Number(match[1]) || null;
+    }
+
+    return null;
   }
+
+
 
   function applyDavMap(rows = []) {
     for (const item of rows) {
@@ -79,7 +105,7 @@
     try {
       const rows = JSON.parse(doc.documentElement?.dataset?.calebeHelperDavClients || '[]');
       if (Array.isArray(rows)) applyDavMap(rows);
-    } catch {}
+    } catch { }
   }
 
   async function getClientDetails(doc, code) {
@@ -174,6 +200,8 @@
     pendingCaixaDavId = davId;
     link.click();
   }
+
+
 
   function installCaixaButtons(doc) {
     if (!isDavListRobust(doc)) return;

@@ -8,7 +8,7 @@
   const THERMAL_PENDING_KEY = 'calebeHelperImpressaoTermicaPendenteV1';
   const PRINT_TYPE_STORAGE_KEY = 'calebeHelperTipoImpressaoDAV';
   const SCAN_INTERVAL_MS = 500;
-  const WAIT_NEW_DAV_MS = 45000;
+  const WAIT_NEW_DAV_MS = 1500;
 
   let observedDocs = new WeakSet();
   let observedPrintSelects = new WeakSet();
@@ -62,6 +62,15 @@
     const path = String(doc.location?.pathname || '');
     return hasProductFields || (/\/dav0[12]\//i.test(path) &&
       Boolean(doc.querySelector('input[id*="cli"], input[name*="cli"]')));
+  }
+
+  // ⬛ Bloco: identifica a tela de confirmação do pagamento.
+  function isPaymentAttentionPage(doc) {
+    if (!doc?.body) return false;
+
+    return /ATENÇÃO AO PAGAMENTO/i.test(
+      normalize(doc.body.innerText || doc.body.textContent)
+    );
   }
 
   function isDavListPage(doc) {
@@ -208,14 +217,27 @@
     observedPrintSelects.add(select);
   }
 
-  // ⬛ Bloco: registra a impressão térmica solicitada para este DAV.
+  // ⬛ Bloco: registra a impressão térmica somente na confirmação do pagamento.
   function beginPendingThermalPrint(doc, control) {
+    if (!isPaymentAttentionPage(doc)) return;
     if (!isFinalizationControl(control)) return;
+
     const select = doc.getElementById('tipoImpressao');
-    if (select?.value !== '3') return;
+
+    let selectedPrintType = select?.value || '';
+
+    // Recupera a última opção salva caso o seletor não esteja nesta tela.
+    if (!selectedPrintType) {
+      try {
+        selectedPrintType = doc.defaultView.localStorage.getItem(PRINT_TYPE_STORAGE_KEY) || '';
+      } catch { }
+    }
+
+    if (selectedPrintType !== '3') return;
 
     const idFromUrl = new URLSearchParams(String(doc.location?.search || '')).get('id');
     const davId = idFromUrl && /^\d+$/.test(idFromUrl) ? Number(idFromUrl) : null;
+
     const state = {
       createdAt: Date.now(),
       davId,
@@ -223,14 +245,25 @@
       sourceUrl: String(doc.location?.href || '')
     };
 
-    // O page-bridge executa no mundo principal; a janela é reservada ainda no clique do usuário.
+    // A janela somente é reservada neste clique, na tela ATENÇÃO AO PAGAMENTO.
     dispatchPageCommand(doc, { action: 'reserve-thermal-print-window' });
 
     try {
-      getTopDocument().defaultView.sessionStorage.setItem(THERMAL_PENDING_KEY, JSON.stringify(state));
-      console.info('[Calebe Helper] Impressão térmica selecionada; janela reservada e aguardando o fechamento bem-sucedido do DAV.');
+      getTopDocument().defaultView.sessionStorage.setItem(
+        THERMAL_PENDING_KEY,
+        JSON.stringify(state)
+      );
+
+      thermalPending = state;
+
+      console.info(
+        '[Calebe Helper] ATENÇÃO AO PAGAMENTO: fechamento solicitado; janela de impressão reservada e aguardando confirmação do servidor por até 2 segundos.'
+      );
     } catch (error) {
-      console.warn('[Calebe Helper] Não foi possível guardar a impressão térmica pendente.', error);
+      console.warn(
+        '[Calebe Helper] Não foi possível guardar a impressão térmica pendente.',
+        error
+      );
     }
   }
 
@@ -396,7 +429,7 @@
     ].join(' ')).toLowerCase();
 
     if (/adicionar|incluir item|novo item|produto|observa[cç][aã]o|limpar|cancelar|voltar/.test(label)) return false;
-    return /finalizar|concluir|gravar dav|salvar dav|confirmar dav|fechar dav|emitir dav|salvar|gravar|confirmar/.test(label);
+    return /finalizar|concluir|gravar dav|salvar dav|confirmar dav|fechar dav|fechar|emitir dav|salvar|gravar|confirmar/.test(label);
   }
 
   function savePendingState() {
@@ -480,9 +513,15 @@
       return;
     }
 
-    if (!isDavCreationPage(doc)) return;
-    beginPendingThermalPrint(doc, control);
-    beginPendingEmit(doc, control);
+    // ⬛ Bloco: emissão automática continua vinculada à tela de criação do DAV.
+    if (isDavCreationPage(doc)) {
+      beginPendingEmit(doc, control);
+    }
+
+    // ⬛ Bloco: impressão térmica somente na tela ATENÇÃO AO PAGAMENTO.
+    if (isPaymentAttentionPage(doc)) {
+      beginPendingThermalPrint(doc, control);
+    }
   }
 
   function attachDocument(doc) {

@@ -56,9 +56,10 @@
         "clienteduplicar.js",
         "clientepesquisa.js",
         "dav1.js",
+        "dav_carregarmais.js",
         "dashboardatalhos.js",
         "fillexcel_modal.js",
-		"novodav_emitir.js",
+        "novodav_emitir.js",
         "novodav.js",
         "xml-downloader.js"
       ],
