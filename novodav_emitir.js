@@ -5,20 +5,68 @@
   const MODULE_ID = 'calebe-helper-emitir-nota';
   const CHECKBOX_ID = 'calebe-helper-emitir-nota-finalizar';
   const PENDING_KEY = 'calebeHelperEmitirNotaPendenteV1';
+  const BASELINE_KEY = `${PENDING_KEY}:baseline`;
   const THERMAL_PENDING_KEY = 'calebeHelperImpressaoTermicaPendenteV1';
   const PRINT_TYPE_STORAGE_KEY = 'calebeHelperTipoImpressaoDAV';
+  const EMIT_STORAGE_KEY = 'calebeHelperEmitirNotaAutomaticamente';
+  const THERMAL_OPTION_VALUE = '3';
+  const THERMAL_WINDOW_NAME = 'calebeHelperThermalPrint';
+  const THERMAL_FRAME_ID = 'calebe-helper-nfe-thermal-frame';
   const SCAN_INTERVAL_MS = 500;
-  const WAIT_NEW_DAV_MS = 1500;
+  const WAIT_NEW_DAV_MS = 45000;
+  const WAIT_THERMAL_CONFIRM_MS = 45000; // o fechar_dav grava venda, estoque e financeiro: pode passar de 2 s
+  const WAIT_THERMAL_RESULT_MS = 12000;
+  const CONFIRMED_CAIXA_RETRY_MS = 2000;
+  const WAIT_CAIXA_PAGE_MS = 30000;
+  const THERMAL_TITLE_TIMEOUT_MS = 15000;
+  const THERMAL_TITLE_INTERVAL_MS = 50;
 
-  let observedDocs = new WeakSet();
-  let observedPrintSelects = new WeakSet();
+  const observedDocs = new WeakSet();
+  const observedPrintSelects = new WeakSet();
   let pending = null;
   let thermalPending = null;
+  let pendingCaixa = null;
   let scanTimer = null;
+  let thermalTitleTimer = null;
+  let lastSavedBaseline = '';
+  let lastConfirmedCaixaAttemptAt = 0;
 
   const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
 
-  const THERMAL_WINDOW_NAME = 'calebeHelperThermalPrint';
+  const getTopDocument = () => {
+    try { return window.top.document; } catch { return document; }
+  };
+
+  // ⬛ Bloco: persistência temporária (sessionStorage da janela principal).
+  const topStorage = () => {
+    try { return getTopDocument().defaultView.sessionStorage; } catch { return null; }
+  };
+
+  function loadState(key, ttl) {
+    const storage = topStorage();
+    try {
+      const raw = storage?.getItem(key);
+      const data = JSON.parse(raw || 'null');
+      if (data?.createdAt && Date.now() - data.createdAt < ttl) return data;
+      if (raw) storage.removeItem(key);
+    } catch { }
+    return null;
+  }
+
+  const saveState = (key, data) => {
+    try { topStorage()?.setItem(key, JSON.stringify(data)); } catch { }
+  };
+
+  const removeState = key => {
+    try { topStorage()?.removeItem(key); } catch { }
+  };
+
+  const loadPending = () => { pending ||= loadState(PENDING_KEY, WAIT_NEW_DAV_MS); };
+  const savePending = () => saveState(PENDING_KEY, pending);
+  const clearPending = () => { pending = null; removeState(PENDING_KEY); };
+
+  const loadThermalPending = () => { thermalPending ||= loadState(THERMAL_PENDING_KEY, WAIT_THERMAL_CONFIRM_MS); };
+  const clearThermalPending = () => { thermalPending = null; removeState(THERMAL_PENDING_KEY); };
 
   function dispatchPageCommand(doc, detail) {
     try {
@@ -31,28 +79,22 @@
     }
   }
 
-  const getTopDocument = () => {
-    try { return window.top.document; } catch { return document; }
-  };
+  function getFrameDocuments(root = getTopDocument(), docs = [], seen = new Set(), depth = 0) {
+    if (!root?.documentElement || seen.has(root) || depth > 4) return docs;
 
-  function getFrameDocuments() {
-    const host = getTopDocument();
-    const docs = [];
-    const seen = new Set();
+    seen.add(root);
+    docs.push(root);
 
-    const add = doc => {
-      if (!doc?.documentElement || seen.has(doc)) return;
-      seen.add(doc);
-      docs.push(doc);
-    };
-
-    add(host);
-    for (const frame of host.querySelectorAll('iframe')) {
-      try { add(frame.contentDocument); } catch { }
+    for (const frame of root.querySelectorAll('iframe')) {
+      let child = null;
+      try { child = frame.contentDocument; } catch { }
+      if (child) getFrameDocuments(child, docs, seen, depth + 1);
     }
+
     return docs;
   }
 
+  // ⬛ Bloco: identificação das telas do DAV.
   function isDavCreationPage(doc) {
     if (!doc?.documentElement) return false;
     const hasProductFields = Boolean(
@@ -64,41 +106,59 @@
       Boolean(doc.querySelector('input[id*="cli"], input[name*="cli"]')));
   }
 
-  // ⬛ Bloco: identifica a tela de confirmação do pagamento.
   function isPaymentAttentionPage(doc) {
     if (!doc?.body) return false;
-
-    return /ATENÇÃO AO PAGAMENTO/i.test(
-      normalize(doc.body.innerText || doc.body.textContent)
-    );
+    return /ATENÇÃO AO PAGAMENTO/i.test(normalize(doc.body.innerText || doc.body.textContent));
   }
+
+  const collectDavRows = doc => doc?.documentElement
+    ? [...doc.querySelectorAll('tr')].filter(row => row.querySelector('button[onclick*="duplicarDav("]'))
+    : [];
 
   function isDavListPage(doc) {
     if (!doc?.documentElement) return false;
     const heading = [...doc.querySelectorAll('h6')].some(el =>
       /DAV01[\s\S]{0,40}Documento Auxiliar de Venda/i.test(el.textContent || '')
     );
-    return heading && Boolean(doc.querySelector('tr button[onclick*="duplicarDav("]'));
+    if (heading) return true;
+
+    // Nas abas novas a listagem pode perder o h6; o botão nativo continua presente.
+    return Boolean(doc.getElementById('btnNovoDav')) && collectDavRows(doc).length > 0;
   }
 
   function extractDavId(row) {
-    const formatted = normalize(row?.textContent).match(/\b\d{3}-(\d{5})\b/);
+    const formatted = String(row?.textContent || '').match(/\b\d{3}-(\d{5,})\b/);
     if (formatted) return Number(formatted[1]) || null;
-    const selected = String(row?.getAttribute?.('onclick') || '').match(/selecionarLinha\s*\(\s*this\s*,\s*(\d+)/);
-    if (selected) return Number(selected[1]) || null;
-    const duplicate = String(row?.querySelector('button[onclick*="duplicarDav("]')?.getAttribute('onclick') || '')
-      .match(/duplicarDav\s*\(\s*(\d+)/);
-    return duplicate ? Number(duplicate[1]) || null : null;
+
+    const onclicks = [
+      row?.getAttribute?.('onclick'),
+      ...[...(row?.querySelectorAll?.('[onclick]') || [])].map(el => el.getAttribute('onclick'))
+    ];
+
+    for (const onclick of onclicks) {
+      const match = String(onclick || '').match(
+        /(?:duplicarDav|abrirDav|selecionarLinha)\s*\(\s*(?:this\s*,\s*)?(\d+)/
+      );
+      if (match) return Number(match[1]) || null;
+    }
+
+    return null;
   }
 
-  function collectDavIds(doc) {
-    if (!isDavListPage(doc)) return [];
-    return [...doc.querySelectorAll('tr')]
-      .filter(row => row.querySelector('button[onclick*="duplicarDav("]'))
-      .map(extractDavId)
-      .filter(id => Number.isFinite(id) && id > 0);
+  const collectDavIds = doc => isDavListPage(doc)
+    ? collectDavRows(doc).map(extractDavId).filter(id => Number.isFinite(id) && id > 0)
+    : [];
+
+  function davIdFromUrl(url) {
+    try {
+      const value = new URL(String(url || '')).searchParams.get('id');
+      return value && /^\d+$/.test(value) ? Number(value) : null;
+    } catch {
+      return null;
+    }
   }
 
+  // ⬛ Bloco: referência dos DAVs existentes (distingue o DAV novo dos antigos).
   function snapshotExistingDavIds() {
     const ids = new Set();
     for (const doc of getFrameDocuments()) {
@@ -107,7 +167,45 @@
     return [...ids];
   }
 
-  function createCheckbox(doc, anchor) {
+  function persistBaseline(ids) {
+    const values = [...new Set((ids || []).map(String))];
+    if (!values.length) return;
+
+    const serialized = JSON.stringify(values);
+    if (serialized === lastSavedBaseline) return;
+
+    try {
+      topStorage().setItem(BASELINE_KEY, serialized);
+      lastSavedBaseline = serialized;
+    } catch { }
+  }
+
+  function restoreBaselineIfAvailable() {
+    if (!pending || (pending.baseline || []).length) return;
+    try {
+      const ids = JSON.parse(topStorage().getItem(BASELINE_KEY) || '[]');
+      if (Array.isArray(ids) && ids.length) {
+        pending.baseline = ids.map(String);
+        savePending();
+      }
+    } catch { }
+  }
+
+  // ⬛ Bloco: checkbox "Emitir nota ao finalizar" com preferência persistente.
+  function installCheckbox(doc) {
+    if (!isDavCreationPage(doc) || doc.getElementById(CHECKBOX_ID)) return;
+
+    const headerRow = doc.querySelector(
+      '.d-flex.align-items-center.justify-content-between.mb-3.flex-wrap.gap-2'
+    );
+    if (!headerRow) return;
+
+    const actionGroup = [...headerRow.children].find(el =>
+      el.matches('.d-flex.gap-2') &&
+      el.querySelector('#btnObs, #btnFecharDav, #btnDetalhes, #btnVoltar2')
+    );
+    if (!actionGroup) return;
+
     const wrapper = doc.createElement('div');
     wrapper.className = 'form-check form-check-inline mb-0 me-2 ms-auto flex-shrink-0';
     wrapper.id = MODULE_ID;
@@ -117,6 +215,8 @@
     input.className = 'form-check-input';
     input.id = CHECKBOX_ID;
     input.autocomplete = 'off';
+    input.checked = localStorage.getItem(EMIT_STORAGE_KEY) === 'true';
+    input.setAttribute('aria-checked', String(input.checked));
 
     const label = doc.createElement('label');
     label.className = 'form-check-label';
@@ -124,57 +224,24 @@
     label.textContent = 'Emitir nota ao finalizar';
 
     wrapper.append(input, label);
-    anchor.insertAdjacentElement('beforebegin', wrapper);
-    return input;
-  }
+    actionGroup.insertAdjacentElement('beforebegin', wrapper);
 
-  function installCheckbox(doc) {
-    if (!isDavCreationPage(doc)) return;
-    if (doc.getElementById(CHECKBOX_ID)) return;
-
-    // ⬛ Bloco: localiza a linha principal do cabeçalho.
-    const headerRow = doc.querySelector(
-      '.d-flex.align-items-center.justify-content-between.mb-3.flex-wrap.gap-2'
-    );
-
-    if (!headerRow) return;
-
-    // ⬛ Bloco: localiza o grupo de botões à direita.
-    const actionGroup = [...headerRow.children].find(el =>
-      el.matches('.d-flex.gap-2') &&
-      el.querySelector(
-        '#btnObs, #btnFecharDav, #btnDetalhes, #btnVoltar2'
-      )
-    );
-
-    if (!actionGroup) return;
-
-    // ⬛ Bloco: insere o checkbox imediatamente antes dos botões.
-    const input = createCheckbox(doc, actionGroup);
-    const STORAGE_KEY = 'calebeHelperEmitirNotaAutomaticamente';
-
-    input.checked = localStorage.getItem(STORAGE_KEY) === 'true';
-    input.setAttribute('aria-checked', String(input.checked));
-
-    // ⬛ Bloco: salva cada alteração para os próximos DAVs.
     input.addEventListener('change', () => {
-      localStorage.setItem(STORAGE_KEY, String(input.checked));
+      localStorage.setItem(EMIT_STORAGE_KEY, String(input.checked));
       input.setAttribute('aria-checked', String(input.checked));
     });
   }
 
-  // ⬛ Bloco: adiciona a opção de impressão térmica no fechamento do DAV.
+  // ⬛ Bloco: opção de impressão térmica no fechamento do DAV.
   function installThermalOption(doc) {
     if (!isDavCreationPage(doc)) return;
     const select = doc.getElementById('tipoImpressao');
-    if (!select || select.querySelector('option[value="3"]')) return;
+    if (!select || select.querySelector(`option[value="${THERMAL_OPTION_VALUE}"]`)) return;
 
     const option = doc.createElement('option');
-    option.value = '3';
+    option.value = THERMAL_OPTION_VALUE;
     option.textContent = 'Imprime DAV — Térmica Bobina 80x40';
-    const noPrint = select.querySelector('option[value="0"]');
-    if (noPrint) select.insertBefore(option, noPrint);
-    else select.appendChild(option);
+    select.insertBefore(option, select.querySelector('option[value="0"]'));
   }
 
   // ⬛ Bloco: restaura e memoriza a última opção de impressão selecionada.
@@ -185,25 +252,15 @@
     if (!select || observedPrintSelects.has(select)) return;
 
     let storage;
-
     try {
       storage = doc.defaultView.localStorage;
-    } catch (error) {
-      console.warn('[Calebe Helper] Não foi possível acessar a preferência de impressão salva.', error);
-      return;
-    }
-
-    try {
-      const savedValue = storage.getItem(PRINT_TYPE_STORAGE_KEY);
-
-      if (
-        savedValue !== null &&
-        [...select.options].some(option => option.value === savedValue)
-      ) {
-        select.value = savedValue;
+      const saved = storage.getItem(PRINT_TYPE_STORAGE_KEY);
+      if (saved !== null && [...select.options].some(option => option.value === saved)) {
+        select.value = saved;
       }
     } catch (error) {
       console.warn('[Calebe Helper] Não foi possível restaurar a opção de impressão salva.', error);
+      if (!storage) return;
     }
 
     select.addEventListener('change', () => {
@@ -219,108 +276,121 @@
 
   // ⬛ Bloco: registra a impressão térmica somente na confirmação do pagamento.
   function beginPendingThermalPrint(doc, control) {
-    if (!isPaymentAttentionPage(doc)) return;
-    if (!isFinalizationControl(control)) return;
+    if (!isPaymentAttentionPage(doc) || !isFinalizationControl(control)) return;
 
-    const select = doc.getElementById('tipoImpressao');
-
-    let selectedPrintType = select?.value || '';
+    let printType = doc.getElementById('tipoImpressao')?.value || '';
 
     // Recupera a última opção salva caso o seletor não esteja nesta tela.
-    if (!selectedPrintType) {
-      try {
-        selectedPrintType = doc.defaultView.localStorage.getItem(PRINT_TYPE_STORAGE_KEY) || '';
-      } catch { }
+    if (!printType) {
+      try { printType = doc.defaultView.localStorage.getItem(PRINT_TYPE_STORAGE_KEY) || ''; } catch { }
     }
+    if (printType !== THERMAL_OPTION_VALUE) return;
 
-    if (selectedPrintType !== '3') return;
-
-    const idFromUrl = new URLSearchParams(String(doc.location?.search || '')).get('id');
-    const davId = idFromUrl && /^\d+$/.test(idFromUrl) ? Number(idFromUrl) : null;
-
-    const state = {
-      createdAt: Date.now(),
-      davId,
-      baseline: snapshotExistingDavIds(),
-      sourceUrl: String(doc.location?.href || '')
-    };
+    const sourceUrl = String(doc.location?.href || '');
+    thermalPending = { createdAt: Date.now(), davId: davIdFromUrl(sourceUrl), sourceUrl };
 
     // A janela somente é reservada neste clique, na tela ATENÇÃO AO PAGAMENTO.
     dispatchPageCommand(doc, { action: 'reserve-thermal-print-window' });
+    saveState(THERMAL_PENDING_KEY, thermalPending);
 
-    try {
-      getTopDocument().defaultView.sessionStorage.setItem(
-        THERMAL_PENDING_KEY,
-        JSON.stringify(state)
-      );
+    console.info(
+      `[Calebe Helper] ATENÇÃO AO PAGAMENTO: fechamento solicitado; janela de impressão reservada e aguardando confirmação do servidor por até ${WAIT_THERMAL_CONFIRM_MS / 1000} segundos.`
+    );
+  }
 
-      thermalPending = state;
-
-      console.info(
-        '[Calebe Helper] ATENÇÃO AO PAGAMENTO: fechamento solicitado; janela de impressão reservada e aguardando confirmação do servidor por até 2 segundos.'
-      );
-    } catch (error) {
-      console.warn(
-        '[Calebe Helper] Não foi possível guardar a impressão térmica pendente.',
-        error
-      );
+  // ⬛ Bloco: remove solicitações térmicas que ficaram sem confirmação do servidor.
+  function expireThermalPending() {
+    loadThermalPending();
+    if (thermalPending && Date.now() - thermalPending.createdAt > WAIT_THERMAL_CONFIRM_MS) {
+      console.warn('[Calebe Helper] O servidor não confirmou o fechamento do DAV dentro do prazo; a impressão térmica não foi acionada.');
+      clearThermalPending();
     }
   }
 
-  function loadPendingThermalPrint() {
-    if (thermalPending) return;
-    try {
-      const storage = getTopDocument().defaultView.sessionStorage;
-      const raw = storage.getItem(THERMAL_PENDING_KEY);
-      const state = JSON.parse(raw || 'null');
-      if (state?.createdAt && Date.now() - state.createdAt < WAIT_NEW_DAV_MS) {
-        thermalPending = state;
-      } else if (raw) {
-        storage.removeItem(THERMAL_PENDING_KEY);
-      }
-    } catch { }
+  // ⬛ Bloco: define o #title da página térmica como "DAV Nº <número>".
+  function stopThermalTitle() {
+    if (thermalTitleTimer) window.clearInterval(thermalTitleTimer);
+    thermalTitleTimer = null;
   }
 
-  function clearPendingThermalPrint() {
-    thermalPending = null;
-    try { getTopDocument().defaultView.sessionStorage.removeItem(THERMAL_PENDING_KEY); } catch { }
+  function startThermalTitle(davId, ...candidateWindows) {
+    stopThermalTitle();
+
+    const id = Number(davId);
+    if (!Number.isFinite(id) || id <= 0) return;
+
+    // Reabre pelo nome a janela reservada (URL vazia não navega a janela existente).
+    let popup = null;
+    for (const win of candidateWindows) {
+      try { popup = win?.open?.('', THERMAL_WINDOW_NAME) || null; } catch { }
+      if (popup) break;
+    }
+    if (!popup) return;
+
+    const expectedTitle = `DAV Nº ${id}`;
+    const deadline = Date.now() + THERMAL_TITLE_TIMEOUT_MS;
+    let announced = false;
+
+    const applyTitle = () => {
+      let docs;
+      try {
+        if (popup.closed) return stopThermalTitle();
+        docs = getFrameDocuments(popup.document);
+      } catch {
+        return; // documento em transição durante a navegação da janela
+      }
+
+      for (const doc of docs) {
+        const title = doc.getElementById('title');
+        if (!title) continue;
+
+        // O SATGO pode reescrever o título após o carregamento; por isso reaplica até o prazo.
+        const prop = /^(INPUT|TEXTAREA|SELECT)$/.test(title.tagName) ? 'value' : 'textContent';
+        if (normalize(title[prop]) !== expectedTitle) {
+          title[prop] = expectedTitle;
+          if (!announced) {
+            announced = true;
+            console.info(`[Calebe Helper] Título da impressão térmica atualizado para "${expectedTitle}".`);
+          }
+        }
+        return;
+      }
+    };
+
+    applyTitle();
+    thermalTitleTimer = window.setInterval(() => {
+      if (Date.now() > deadline) stopThermalTitle();
+      else applyTitle();
+    }, THERMAL_TITLE_INTERVAL_MS);
   }
 
   // ⬛ Bloco: prepara o módulo nfe001 e executa a impressão nativa após confirmação do servidor.
   function requestThermalPrintAfterClose(sourceDoc, detail = {}) {
-    loadPendingThermalPrint();
+    loadThermalPending();
     if (!thermalPending) return;
 
-    const davId = Number(detail.davId || thermalPending.davId) || null;
-    if (!davId) {
-      console.error('[Calebe Helper] O SATGO confirmou o fechamento, mas não foi possível identificar o ID do DAV.');
-      clearPendingThermalPrint();
-      return;
-    }
+    const fail = message => {
+      stopThermalTitle();
+      console.error(`[Calebe Helper] ${message}`);
+      clearThermalPending();
+    };
 
+    const davId = Number(detail.davId || thermalPending.davId) || null;
+    if (!davId) return fail('O SATGO confirmou o fechamento, mas não foi possível identificar o ID do DAV.');
     if (thermalPending.davId && Number(thermalPending.davId) !== davId) return;
 
     let sourceUrl;
     try { sourceUrl = new URL(thermalPending.sourceUrl); }
-    catch {
-      console.error('[Calebe Helper] Não foi possível recuperar a origem do DAV para preparar a impressão térmica.');
-      clearPendingThermalPrint();
-      return;
-    }
+    catch { return fail('Não foi possível recuperar a origem do DAV para preparar a impressão térmica.'); }
 
     const sessionKey = sourceUrl.searchParams.get('chave');
-    if (!sessionKey) {
-      console.error('[Calebe Helper] Não foi possível recuperar a chave de sessão para preparar a impressão térmica.');
-      clearPendingThermalPrint();
-      return;
-    }
+    if (!sessionKey) return fail('Não foi possível recuperar a chave de sessão para preparar a impressão térmica.');
 
     const host = getTopDocument();
-    const frameId = 'calebe-helper-nfe-thermal-frame';
-    let frame = host.getElementById(frameId);
+    let frame = host.getElementById(THERMAL_FRAME_ID);
     if (!frame) {
       frame = host.createElement('iframe');
-      frame.id = frameId;
+      frame.id = THERMAL_FRAME_ID;
       frame.title = 'Preparação da impressão térmica';
       frame.setAttribute('aria-hidden', 'true');
       frame.style.cssText = 'position:fixed;width:1px;height:1px;left:-10000px;top:-10000px;border:0;opacity:0;pointer-events:none;';
@@ -328,90 +398,173 @@
     }
 
     const requestId = `thermal-${Date.now()}-${davId}`;
-    let resultHandled = false;
+    let nfeDoc = null;
     let resultTimer = null;
+    let finished = false;
 
-    const handleResult = event => {
-      const result = event.detail || {};
-      if (result.id !== requestId || resultHandled) return;
-      resultHandled = true;
-      if (resultTimer) clearTimeout(resultTimer);
-      frame.contentDocument?.removeEventListener('calebe-helper:thermal-print-result', handleResult);
+    const finish = errorMessage => {
+      if (finished) return;
+      finished = true;
+      window.clearTimeout(resultTimer);
+      nfeDoc?.removeEventListener('calebe-helper:thermal-print-result', onResult);
 
-      if (result.ok) {
-        console.info(`[Calebe Helper] DAV ${davId} fechado com sucesso; função nativa abrirEspelhoDavTermico(${davId}) executada.`);
-        clearPendingThermalPrint();
-      } else {
-        console.error('[Calebe Helper] O módulo nfe001 não conseguiu executar a impressão térmica:', result.error || 'erro não informado');
-        clearPendingThermalPrint();
-      }
+      if (errorMessage) return fail(errorMessage);
+      console.info(`[Calebe Helper] DAV ${davId} fechado com sucesso; função nativa abrirEspelhoDavTermico(${davId}) executada.`);
+      clearThermalPending();
     };
 
-    const executeInNfeFrame = () => {
-      let nfeDoc;
-      try { nfeDoc = frame.contentDocument; } catch { nfeDoc = null; }
-      if (!nfeDoc?.documentElement) return;
+    function onResult(event) {
+      const result = event.detail || {};
+      if (result.id !== requestId) return;
+      finish(result.ok ? '' : `O módulo nfe001 não conseguiu executar a impressão térmica: ${result.error || 'erro não informado'}`);
+    }
 
-      nfeDoc.addEventListener('calebe-helper:thermal-print-result', handleResult);
+    const executeInNfeFrame = () => {
+      try { nfeDoc = frame.contentDocument; } catch { nfeDoc = null; }
+      if (!nfeDoc?.documentElement || finished) return;
+      frame.onload = null; // impede reexecução caso a página nfe001 recarregue
+
+      nfeDoc.addEventListener('calebe-helper:thermal-print-result', onResult);
       console.info(`[Calebe Helper] Fechamento do DAV ${davId} confirmado pelo servidor; carregando o módulo nativo de impressão.`);
+      startThermalTitle(davId, sourceDoc.defaultView, frame.contentWindow, window);
+
       if (!dispatchPageCommand(nfeDoc, {
         action: 'print-thermal-dav',
         davId,
         requestId,
         windowName: THERMAL_WINDOW_NAME
       })) {
-        nfeDoc.removeEventListener('calebe-helper:thermal-print-result', handleResult);
-        console.error('[Calebe Helper] Não foi possível enviar a solicitação ao módulo nativo de impressão.');
-        clearPendingThermalPrint();
-        return;
+        return finish('Não foi possível enviar a solicitação ao módulo nativo de impressão.');
       }
 
-      resultTimer = window.setTimeout(() => {
-        if (resultHandled) return;
-        resultHandled = true;
-        nfeDoc.removeEventListener('calebe-helper:thermal-print-result', handleResult);
-        console.error('[Calebe Helper] O módulo nfe001 não respondeu à solicitação de impressão térmica.');
-        clearPendingThermalPrint();
-      }, 12000);
+      resultTimer = window.setTimeout(
+        () => finish('O módulo nfe001 não respondeu à solicitação de impressão térmica.'),
+        WAIT_THERMAL_RESULT_MS
+      );
     };
 
     // Reutiliza a página nfe001 que contém a função nativa; não depende de ela já estar visível na tela.
     const nfeUrl = new URL('/calweb/modulos/nfe001/nfe001.php', sourceUrl.origin);
     nfeUrl.searchParams.set('chave', sessionKey);
-    const desiredUrl = nfeUrl.href;
     let currentUrl = '';
     try { currentUrl = frame.contentWindow.location.href; } catch { }
 
-    if (currentUrl === desiredUrl && frame.contentDocument?.readyState === 'complete') {
+    if (currentUrl === nfeUrl.href && frame.contentDocument?.readyState === 'complete') {
       executeInNfeFrame();
     } else {
       frame.onload = executeInNfeFrame;
-      frame.src = desiredUrl;
+      frame.src = nfeUrl.href;
     }
+  }
+
+  // ⬛ Bloco: usa a mesma rotina do botão Caixa DAV da listagem, agora com o ID confirmado pelo servidor.
+  function openCaixaForDav(davId) {
+    const id = Number(davId);
+    if (!Number.isFinite(id) || id <= 0) return false;
+
+    if (typeof window.calebeHelperOpenCaixaDav === 'function') {
+      try {
+        window.calebeHelperOpenCaixaDav(id);
+        return true;
+      } catch { }
+    }
+
+    // Alternativa autônoma para pacotes que não expõem a rotina da dav1.js.
+    let link = null;
+    for (const doc of getFrameDocuments()) {
+      link = doc.querySelector('a[href*="modulos/nfe001/nfe001.php"]');
+      if (link) break;
+    }
+    if (!link) return false;
+
+    pendingCaixa = { davId: id, createdAt: Date.now() };
+    link.click();
+    return true;
+  }
+
+  // ⬛ Bloco: conclui a abertura da Caixa DAV quando a página nfe001 carrega.
+  function isNfeCaixaPage(doc) {
+    if (!doc?.documentElement) return false;
+    if (/\/modulos\/nfe001\/nfe001\.php$/i.test(String(doc.location?.pathname || ''))) return true;
+    return Boolean(doc.getElementById('filtAcao')) ||
+      Boolean(doc.querySelector('a[onclick*="abrirCaixaDav("]'));
+  }
+
+  function installPendingCaixa(doc) {
+    if (!pendingCaixa) return;
+
+    if (Date.now() - pendingCaixa.createdAt > WAIT_CAIXA_PAGE_MS) {
+      pendingCaixa = null;
+      return;
+    }
+
+    if (!isNfeCaixaPage(doc)) return;
+
+    const mode = doc.getElementById('filtAcao');
+    if (mode && mode.value !== 'emitir') {
+      mode.value = 'emitir';
+      mode.dispatchEvent(new doc.defaultView.Event('change', { bubbles: true }));
+      return;
+    }
+
+    const nativeLink = [...doc.querySelectorAll('a[onclick*="abrirCaixaDav("]')].find(link => {
+      const match = String(link.getAttribute('onclick') || '').match(/abrirCaixaDav\s*\(\s*(\d+)\s*,\s*1/);
+      return match && Number(match[1]) === pendingCaixa.davId;
+    });
+    if (!nativeLink) return;
+
+    pendingCaixa = null;
+    nativeLink.click();
+  }
+
+  // ⬛ Bloco: emissão automática após a confirmação do fechamento do DAV.
+  function openConfirmedCaixa(davId) {
+    if (!openCaixaForDav(davId)) return false;
+    clearPending();
+    console.info(`[Calebe Helper] Fechamento do DAV ${davId} confirmado; Caixa DAV aberta automaticamente.`);
+    return true;
+  }
+
+  function confirmPendingEmit(detail = {}) {
+    loadPending();
+    if (!pending) return;
+
+    const detailDavId = Number(detail.davId) || null;
+    const pendingDavId = Number(pending.davId) || null;
+    if (pendingDavId && detailDavId && pendingDavId !== detailDavId) return;
+
+    const davId = detailDavId || pendingDavId;
+    if (!davId) return;
+
+    pending.confirmedDavId = davId;
+    savePending();
+
+    if (!openConfirmedCaixa(davId)) {
+      console.warn('[Calebe Helper] O DAV foi fechado, mas a Caixa DAV não abriu pela rotina compartilhada; tentando pela listagem.');
+    }
+  }
+
+  function retryConfirmedCaixa() {
+    if (!pending?.confirmedDavId) return;
+    if (Date.now() - lastConfirmedCaixaAttemptAt < CONFIRMED_CAIXA_RETRY_MS) return;
+
+    lastConfirmedCaixaAttemptAt = Date.now();
+    openConfirmedCaixa(Number(pending.confirmedDavId));
   }
 
   // ⬛ Bloco: recebe a confirmação real da mesma resposta usada pelo fechamento nativo.
   function onDavCloseConfirmed(doc, event) {
     const detail = event.detail || {};
     if (!detail.ok) return;
-    loadPendingThermalPrint();
-    if (!thermalPending) return;
-    const sourcePath = (() => {
-      try { return new URL(thermalPending.sourceUrl).pathname; }
-      catch { return ''; }
-    })();
-    if (!/\/dav0[12]\/dav0[12]_form\.php$/i.test(sourcePath)) return;
-    requestThermalPrintAfterClose(doc, detail);
-  }
 
-  // ⬛ Bloco: remove solicitações que ficaram sem confirmação do servidor.
-  function tryOpenThermalPrint() {
-    loadPendingThermalPrint();
-    if (!thermalPending) return;
-    if (Date.now() - thermalPending.createdAt > WAIT_NEW_DAV_MS) {
-      console.warn('[Calebe Helper] O servidor não confirmou o fechamento do DAV dentro do prazo; a impressão térmica não foi acionada.');
-      clearPendingThermalPrint();
+    loadThermalPending();
+    if (thermalPending) {
+      let sourcePath = '';
+      try { sourcePath = new URL(thermalPending.sourceUrl).pathname; } catch { }
+      if (/\/dav0[12]\/dav0[12]_form\.php$/i.test(sourcePath)) requestThermalPrintAfterClose(doc, detail);
     }
+
+    confirmPendingEmit(detail);
   }
 
   function isFinalizationControl(control) {
@@ -432,149 +585,140 @@
     return /finalizar|concluir|gravar dav|salvar dav|confirmar dav|fechar dav|fechar|emitir dav|salvar|gravar|confirmar/.test(label);
   }
 
-  function savePendingState() {
-    try {
-      getTopDocument().defaultView.sessionStorage.setItem(PENDING_KEY, JSON.stringify(pending));
-    } catch { }
-  }
-
-  function clearPendingState() {
-    pending = null;
-    try { getTopDocument().defaultView.sessionStorage.removeItem(PENDING_KEY); } catch { }
-  }
-
-  function loadPendingState() {
-    if (pending) return;
-    try {
-      const raw = getTopDocument().defaultView.sessionStorage.getItem(PENDING_KEY);
-      const data = JSON.parse(raw || 'null');
-      if (data && data.createdAt && Date.now() - data.createdAt < WAIT_NEW_DAV_MS) pending = data;
-      else if (raw) getTopDocument().defaultView.sessionStorage.removeItem(PENDING_KEY);
-    } catch { }
+  function isEmitPreferenceEnabled(doc) {
+    const checkbox = doc.getElementById(CHECKBOX_ID);
+    if (checkbox) return checkbox.checked;
+    try { return getTopDocument().defaultView.localStorage.getItem(EMIT_STORAGE_KEY) === 'true'; } catch { return false; }
   }
 
   function beginPendingEmit(doc, control) {
-    const checkbox = doc.getElementById(CHECKBOX_ID);
-    if (!checkbox?.checked || pending || !isFinalizationControl(control)) return;
+    if (!isFinalizationControl(control)) return;
+
+    if (pending && Date.now() - pending.createdAt > WAIT_NEW_DAV_MS) clearPending();
+
+    // Cada nova etapa de finalização renova o prazo (ex.: pagamento demorado).
+    if (pending) {
+      const checkbox = doc.getElementById(CHECKBOX_ID);
+      if (checkbox && !checkbox.checked) {
+        clearPending();
+        return;
+      }
+      pending.createdAt = Date.now();
+      pending.davId ||= davIdFromUrl(doc.location?.href);
+      savePending();
+      return;
+    }
+
+    if (!isEmitPreferenceEnabled(doc)) return;
 
     const baseline = snapshotExistingDavIds();
+    persistBaseline(baseline);
+
+    lastConfirmedCaixaAttemptAt = 0;
+    pendingCaixa = null;
     pending = {
       createdAt: Date.now(),
       baseline,
-      sourceUrl: String(doc.location?.href || ''),
-      control: normalize(control.textContent || control.value || control.title)
+      davId: davIdFromUrl(doc.location?.href),
+      confirmedDavId: null
     };
-    savePendingState();
+    savePending();
     console.info('[Calebe Helper] Emissão automática marcada; aguardando a confirmação do DAV salvo.');
   }
 
   function tryOpenCaixa(doc) {
-    if (!pending || Date.now() - pending.createdAt > WAIT_NEW_DAV_MS) {
-      if (pending) {
-        console.warn('[Calebe Helper] Não foi possível localizar o novo DAV dentro do prazo; a Caixa DAV não foi aberta automaticamente.');
-        clearPendingState();
-      }
+    if (!pending) return;
+
+    if (Date.now() - pending.createdAt > WAIT_NEW_DAV_MS) {
+      const missingBaseline = !(pending.baseline || []).length && !pending.confirmedDavId;
+      console.warn(
+        missingBaseline
+          ? '[Calebe Helper] Não foi possível localizar o novo DAV dentro do prazo; a listagem de DAVs não estava aberta para registrar a referência inicial.'
+          : '[Calebe Helper] Não foi possível localizar o novo DAV dentro do prazo; a Caixa DAV não foi aberta automaticamente.'
+      );
+      clearPending();
       return;
     }
+
     if (!isDavListPage(doc)) return;
 
     const baseline = new Set((pending.baseline || []).map(String));
-    const candidates = [...doc.querySelectorAll('tr')]
-      .map(row => ({ row, id: extractDavId(row), button: row.querySelector('button.calebe-helper-caixa-dav') }))
-      .filter(item => item.id && !baseline.has(String(item.id)));
+    const confirmedId = Number(pending.confirmedDavId) || null;
+    const rows = collectDavRows(doc)
+      .map(row => ({ id: extractDavId(row), button: row.querySelector('button.calebe-helper-caixa-dav') }))
+      .filter(item => Number.isFinite(item.id) && item.id > 0);
+
+    // Sem referência inicial não dá para diferenciar o DAV novo dos antigos.
+    if (!confirmedId && !baseline.size) return;
+    const candidates = rows.filter(item => confirmedId ? item.id === confirmedId : !baseline.has(String(item.id)));
 
     // A dav1.js instala o botão Caixa DAV via MutationObserver. Aguarda até ele aparecer.
     const ready = candidates.find(item => item.button && !item.button.disabled);
     if (!ready) return;
 
-    const id = ready.id;
-    clearPendingState();
-    console.info(`[Calebe Helper] DAV ${id} identificado; abrindo a mesma Caixa DAV do botão existente.`);
+    clearPending();
+    console.info(`[Calebe Helper] DAV ${ready.id} identificado; abrindo a mesma Caixa DAV do botão existente.`);
     ready.button.click();
   }
 
+  // ⬛ Bloco: cliques nos documentos observados.
   function onDocumentClick(doc, event) {
     const target = event.target instanceof doc.defaultView.Element ? event.target : null;
-    if (!target) return;
-    const control = target.closest('button, a, input[type="button"], input[type="submit"]');
+    const control = target?.closest('button, a, input[type="button"], input[type="submit"]');
     if (!control) return;
 
     // Guarda a lista atual antes de abrir um DAV novo.
     if (control.id === 'btnNovoDav' || /novo dav/i.test(normalize(control.textContent || control.title))) {
-      const ids = snapshotExistingDavIds();
-      if (ids.length) {
-        try {
-          getTopDocument().defaultView.sessionStorage.setItem(
-            `${PENDING_KEY}:baseline`,
-            JSON.stringify(ids)
-          );
-        } catch { }
-      }
+      persistBaseline(snapshotExistingDavIds());
       return;
     }
 
-    // ⬛ Bloco: emissão automática continua vinculada à tela de criação do DAV.
-    if (isDavCreationPage(doc)) {
-      beginPendingEmit(doc, control);
-    }
+    // Emissão automática: tela de criação do DAV; a tela ATENÇÃO AO PAGAMENTO renova o prazo.
+    const paymentPage = isPaymentAttentionPage(doc);
+    if (paymentPage || isDavCreationPage(doc)) beginPendingEmit(doc, control);
 
-    // ⬛ Bloco: impressão térmica somente na tela ATENÇÃO AO PAGAMENTO.
-    if (isPaymentAttentionPage(doc)) {
-      beginPendingThermalPrint(doc, control);
-    }
+    // Impressão térmica somente na tela ATENÇÃO AO PAGAMENTO.
+    if (paymentPage) beginPendingThermalPrint(doc, control);
   }
 
-  function attachDocument(doc) {
-    if (!doc?.documentElement || observedDocs.has(doc)) return;
-    observedDocs.add(doc);
-    doc.addEventListener('click', event => onDocumentClick(doc, event), true);
-    doc.addEventListener('calebe-helper:dav-close-confirmed', event => onDavCloseConfirmed(doc, event));
-
-    const observer = new MutationObserver(() => {
-      installCheckbox(doc);
-      installThermalOption(doc);
-      installPrintTypePreference(doc);
-      tryOpenCaixa(doc);
-      tryOpenThermalPrint(doc);
-    });
-    observer.observe(doc.documentElement, { childList: true, subtree: true });
-
+  function installAll(doc) {
     installCheckbox(doc);
     installThermalOption(doc);
     installPrintTypePreference(doc);
+    installPendingCaixa(doc);
     tryOpenCaixa(doc);
-    tryOpenThermalPrint(doc);
+    expireThermalPending();
   }
 
-  function restoreBaselineIfAvailable() {
-    if (!pending || (pending.baseline || []).length) return;
-    try {
-      const raw = getTopDocument().defaultView.sessionStorage.getItem(`${PENDING_KEY}:baseline`);
-      const ids = JSON.parse(raw || '[]');
-      if (Array.isArray(ids) && ids.length) {
-        pending.baseline = ids.map(String);
-        savePendingState();
-      }
-    } catch { }
+  function attachDocument(doc) {
+    if (!doc?.documentElement) return;
+
+    if (!observedDocs.has(doc)) {
+      observedDocs.add(doc);
+      doc.addEventListener('click', event => onDocumentClick(doc, event), true);
+      doc.addEventListener('calebe-helper:dav-close-confirmed', event => onDavCloseConfirmed(doc, event));
+      new MutationObserver(() => installAll(doc)).observe(doc.documentElement, { childList: true, subtree: true });
+    }
+
+    installAll(doc);
   }
 
   function scan() {
-    loadPendingState();
-    loadPendingThermalPrint();
+    loadPending();
+    loadThermalPending();
     restoreBaselineIfAvailable();
-    for (const doc of getFrameDocuments()) {
-      attachDocument(doc);
-      installCheckbox(doc);
-      installThermalOption(doc);
-      installPrintTypePreference(doc);
-      tryOpenCaixa(doc);
-      tryOpenThermalPrint(doc);
-    }
+
+    if (pending) retryConfirmedCaixa();
+    // Mantém a última listagem conhecida como referência para o próximo DAV.
+    else persistBaseline(snapshotExistingDavIds());
+
+    getFrameDocuments().forEach(attachDocument);
   }
 
   scan();
   scanTimer = window.setInterval(scan, SCAN_INTERVAL_MS);
   window.addEventListener('pagehide', () => {
-    if (scanTimer) window.clearInterval(scanTimer);
+    window.clearInterval(scanTimer);
+    stopThermalTitle();
   }, { once: true });
 })();
