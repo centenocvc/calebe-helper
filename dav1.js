@@ -193,12 +193,21 @@
     }
   }
 
+  function openCaixaDav(davId) {
+    const id = Number(davId);
+    const link = document.querySelector('a[href*="modulos/nfe001/nfe001.php"]');
+    if (!Number.isFinite(id) || id <= 0 || !link) {
+      throw new Error('DAV ou link do Emissor NF-e não encontrado.');
+    }
+    pendingCaixaDavId = id;
+    link.click();
+    return true;
+  }
+
   function requestCaixa(row) {
     const davId = extractDavId(row);
-    const link = document.querySelector('a[href*="modulos/nfe001/nfe001.php"]');
-    if (!davId || !link) throw new Error('DAV ou link do Emissor NF-e não encontrado.');
-    pendingCaixaDavId = davId;
-    link.click();
+    if (!davId) throw new Error('DAV não encontrado na listagem.');
+    openCaixaDav(davId);
   }
 
 
@@ -272,4 +281,7 @@
 
   observeFrame();
   new MutationObserver(observeFrame).observe(document.documentElement, { childList: true, subtree: true });
+
+  // Permite que outros módulos abram a Caixa DAV com o ID já confirmado pelo servidor.
+  window.calebeHelperOpenCaixaDav = openCaixaDav;
 })();

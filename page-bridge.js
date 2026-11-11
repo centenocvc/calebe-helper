@@ -24,7 +24,10 @@
           try {
             const data = await response.clone().json();
             if (!data?.erro) {
-              const davId = Number(new URLSearchParams(window.location.search).get('id')) || null;
+              const formDavId = body.get('id') || body.get('davId') || body.get('dav_id');
+              const responseDavId = data?.id || data?.davId || data?.dav_id || data?.OrcamentoCodigo;
+              const davId = Number(new URLSearchParams(window.location.search).get('id')) ||
+                Number(formDavId) || Number(responseDavId) || null;
               emit('dav-close-confirmed', { davId, ok: true });
             }
           } catch (_) {}
