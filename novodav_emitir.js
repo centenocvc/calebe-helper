@@ -74,7 +74,7 @@
       doc.dispatchEvent(new EventCtor('calebe-helper:command', { detail }));
       return true;
     } catch (error) {
-      console.warn('[Calebe Helper] Não foi possível enviar o comando ao contexto da página.', error);
+//       console.warn('[Calebe Helper] Não foi possível enviar o comando ao contexto da página.', error);
       return false;
     }
   }
@@ -259,7 +259,7 @@
         select.value = saved;
       }
     } catch (error) {
-      console.warn('[Calebe Helper] Não foi possível restaurar a opção de impressão salva.', error);
+//       console.warn('[Calebe Helper] Não foi possível restaurar a opção de impressão salva.', error);
       if (!storage) return;
     }
 
@@ -267,7 +267,7 @@
       try {
         storage.setItem(PRINT_TYPE_STORAGE_KEY, select.value);
       } catch (error) {
-        console.warn('[Calebe Helper] Não foi possível salvar a opção de impressão selecionada.', error);
+//         console.warn('[Calebe Helper] Não foi possível salvar a opção de impressão selecionada.', error);
       }
     });
 
@@ -279,30 +279,53 @@
     if (!isPaymentAttentionPage(doc) || !isFinalizationControl(control)) return;
 
     let printType = doc.getElementById('tipoImpressao')?.value || '';
-
-    // Recupera a última opção salva caso o seletor não esteja nesta tela.
     if (!printType) {
       try { printType = doc.defaultView.localStorage.getItem(PRINT_TYPE_STORAGE_KEY) || ''; } catch { }
     }
     if (printType !== THERMAL_OPTION_VALUE) return;
 
     const sourceUrl = String(doc.location?.href || '');
-    thermalPending = { createdAt: Date.now(), davId: davIdFromUrl(sourceUrl), sourceUrl };
+    const davId = davIdFromUrl(sourceUrl);
+    thermalPending = { createdAt: Date.now(), davId, sourceUrl };
 
-    // A janela somente é reservada neste clique, na tela ATENÇÃO AO PAGAMENTO.
-    dispatchPageCommand(doc, { action: 'reserve-thermal-print-window' });
+    // Monta a mesma URL que os tipos nativos usam (animação/carregamento igual)
+    let reserveUrl = 'about:blank';
+    try {
+      const u = new URL(sourceUrl);
+      const chave = u.searchParams.get('chave');
+      if (davId && chave) {
+        // caminho relativo ao módulo dav01 (mesmo padrão do sistema)
+        const pdf = new URL('dav01_pdf.php', u.href);
+        // se a página atual não estiver em /dav01/, força o caminho completo do módulo
+        if (!/\/dav0[12]\//i.test(u.pathname)) {
+          pdf.pathname = u.pathname.replace(/\/[^/]*$/, '/dav01_pdf.php');
+          // fallback mais seguro:
+          pdf.pathname = '/calweb/modulos/dav01/dav01_pdf.php';
+        }
+        pdf.searchParams.set('id', String(davId));
+        pdf.searchParams.set('chave', chave);
+        reserveUrl = pdf.href;
+      }
+    } catch (e) {
+//       console.warn('[Calebe Helper] Não foi possível montar dav01_pdf.php; usando about:blank.', e);
+    }
+
+    dispatchPageCommand(doc, {
+      action: 'reserve-thermal-print-window',
+      url: reserveUrl
+    });
     saveState(THERMAL_PENDING_KEY, thermalPending);
 
-    console.info(
-      `[Calebe Helper] ATENÇÃO AO PAGAMENTO: fechamento solicitado; janela de impressão reservada e aguardando confirmação do servidor por até ${WAIT_THERMAL_CONFIRM_MS / 1000} segundos.`
-    );
+//     console.info(
+//       `[Calebe Helper] ATENÇÃO AO PAGAMENTO: fechamento solicitado; janela de impressão reservada (${reserveUrl === 'about:blank' ? 'about:blank' : 'dav01_pdf.php'}) e aguardando confirmação do servidor por até ${WAIT_THERMAL_CONFIRM_MS / 1000} segundos.`
+//     );
   }
 
   // ⬛ Bloco: remove solicitações térmicas que ficaram sem confirmação do servidor.
   function expireThermalPending() {
     loadThermalPending();
     if (thermalPending && Date.now() - thermalPending.createdAt > WAIT_THERMAL_CONFIRM_MS) {
-      console.warn('[Calebe Helper] O servidor não confirmou o fechamento do DAV dentro do prazo; a impressão térmica não foi acionada.');
+//       console.warn('[Calebe Helper] O servidor não confirmou o fechamento do DAV dentro do prazo; a impressão térmica não foi acionada.');
       clearThermalPending();
     }
   }
@@ -350,7 +373,7 @@
           title[prop] = expectedTitle;
           if (!announced) {
             announced = true;
-            console.info(`[Calebe Helper] Título da impressão térmica atualizado para "${expectedTitle}".`);
+//             console.info(`[Calebe Helper] Título da impressão térmica atualizado para "${expectedTitle}".`);
           }
         }
         return;
@@ -371,7 +394,7 @@
 
     const fail = message => {
       stopThermalTitle();
-      console.error(`[Calebe Helper] ${message}`);
+//       console.error(`[Calebe Helper] ${message}`);
       clearThermalPending();
     };
 
@@ -409,7 +432,7 @@
       nfeDoc?.removeEventListener('calebe-helper:thermal-print-result', onResult);
 
       if (errorMessage) return fail(errorMessage);
-      console.info(`[Calebe Helper] DAV ${davId} fechado com sucesso; função nativa abrirEspelhoDavTermico(${davId}) executada.`);
+//       console.info(`[Calebe Helper] DAV ${davId} fechado com sucesso; função nativa abrirEspelhoDavTermico(${davId}) executada.`);
       clearThermalPending();
     };
 
@@ -425,7 +448,7 @@
       frame.onload = null; // impede reexecução caso a página nfe001 recarregue
 
       nfeDoc.addEventListener('calebe-helper:thermal-print-result', onResult);
-      console.info(`[Calebe Helper] Fechamento do DAV ${davId} confirmado pelo servidor; carregando o módulo nativo de impressão.`);
+//       console.info(`[Calebe Helper] Fechamento do DAV ${davId} confirmado pelo servidor; carregando o módulo nativo de impressão.`);
       startThermalTitle(davId, sourceDoc.defaultView, frame.contentWindow, window);
 
       if (!dispatchPageCommand(nfeDoc, {
@@ -521,7 +544,7 @@
   function openConfirmedCaixa(davId) {
     if (!openCaixaForDav(davId)) return false;
     clearPending();
-    console.info(`[Calebe Helper] Fechamento do DAV ${davId} confirmado; Caixa DAV aberta automaticamente.`);
+//     console.info(`[Calebe Helper] Fechamento do DAV ${davId} confirmado; Caixa DAV aberta automaticamente.`);
     return true;
   }
 
@@ -540,7 +563,7 @@
     savePending();
 
     if (!openConfirmedCaixa(davId)) {
-      console.warn('[Calebe Helper] O DAV foi fechado, mas a Caixa DAV não abriu pela rotina compartilhada; tentando pela listagem.');
+//       console.warn('[Calebe Helper] O DAV foi fechado, mas a Caixa DAV não abriu pela rotina compartilhada; tentando pela listagem.');
     }
   }
 
@@ -623,7 +646,7 @@
       confirmedDavId: null
     };
     savePending();
-    console.info('[Calebe Helper] Emissão automática marcada; aguardando a confirmação do DAV salvo.');
+//     console.info('[Calebe Helper] Emissão automática marcada; aguardando a confirmação do DAV salvo.');
   }
 
   function tryOpenCaixa(doc) {
@@ -631,11 +654,11 @@
 
     if (Date.now() - pending.createdAt > WAIT_NEW_DAV_MS) {
       const missingBaseline = !(pending.baseline || []).length && !pending.confirmedDavId;
-      console.warn(
-        missingBaseline
-          ? '[Calebe Helper] Não foi possível localizar o novo DAV dentro do prazo; a listagem de DAVs não estava aberta para registrar a referência inicial.'
-          : '[Calebe Helper] Não foi possível localizar o novo DAV dentro do prazo; a Caixa DAV não foi aberta automaticamente.'
-      );
+//       console.warn(
+//         missingBaseline
+//           ? '[Calebe Helper] Não foi possível localizar o novo DAV dentro do prazo; a listagem de DAVs não estava aberta para registrar a referência inicial.'
+//           : '[Calebe Helper] Não foi possível localizar o novo DAV dentro do prazo; a Caixa DAV não foi aberta automaticamente.'
+//       );
       clearPending();
       return;
     }
@@ -657,7 +680,7 @@
     if (!ready) return;
 
     clearPending();
-    console.info(`[Calebe Helper] DAV ${ready.id} identificado; abrindo a mesma Caixa DAV do botão existente.`);
+//     console.info(`[Calebe Helper] DAV ${ready.id} identificado; abrindo a mesma Caixa DAV do botão existente.`);
     ready.button.click();
   }
 

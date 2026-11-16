@@ -97,7 +97,7 @@
     }
 
     if (Number(pending.clicks) >= MAX_LOAD_MORE_CLICKS) {
-      console.warn(`[Calebe Helper] DAV ${davId} não apareceu após ${MAX_LOAD_MORE_CLICKS} cliques em Carregar mais.`);
+//       console.warn(`[Calebe Helper] DAV ${davId} não apareceu após ${MAX_LOAD_MORE_CLICKS} cliques em Carregar mais.`);
       clearPending();
       return;
     }

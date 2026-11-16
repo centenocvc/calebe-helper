@@ -220,7 +220,7 @@
     const oldHeader = oldHeaderInput?.closest('th');
     if (oldHeader?.dataset?.xmlDownloaderColumn === '1') {
       oldHeader.remove();
-      console.warn('[Calebe Helper] Colunas reparadas. Recarregue a página uma vez para restaurar o cabeçalho nativo.');
+//       console.warn('[Calebe Helper] Colunas reparadas. Recarregue a página uma vez para restaurar o cabeçalho nativo.');
     }
     doc.querySelectorAll('th.xml-downloader-col,td.xml-downloader-col').forEach(cell => {
       cell.classList.remove('xml-downloader-col');
@@ -359,7 +359,7 @@
       }
     }).catch(err => {
       row.dataset.xmlDownloaderClientState = 'error';
-      if (window.__calebeHelperDebug) console.warn('[Calebe Helper] Falha ao obter endereço da nota.', err);
+      if (window.__calebeHelperDebug) /* console.warn('[Calebe Helper] Falha ao obter endereço da nota.', err) */ void 0;
     });
   }
 
@@ -648,13 +648,13 @@
     const formats = selectedFormats(doc);
     if (!formats.xml && !formats.pdf) {
       toastDismissed = false;
-      console.warn('[Calebe Helper] Selecione XML ou PDF.');
+//       console.warn('[Calebe Helper] Selecione XML ou PDF.');
       return;
     }
     const selected = getPresentedCheckboxes(doc).filter(input => input.checked);
     if (!selected.length) {
       toastDismissed = false;
-      console.warn('[Calebe Helper] Selecione pelo menos uma nota.');
+//       console.warn('[Calebe Helper] Selecione pelo menos uma nota.');
       return;
     }
 
@@ -688,14 +688,14 @@
           ok += 1;
         } catch (err) {
           errors += 1;
-          console.warn('[Calebe Helper] Falha ao baixar XML/PDF da nota.', err);
+//           console.warn('[Calebe Helper] Falha ao baixar XML/PDF da nota.', err);
         }
       }
       if (formats.zip && zipFiles.length) {
         showToast(doc, `Gerando ZIP com ${zipFiles.length} arquivo${zipFiles.length === 1 ? '' : 's'}...`);
         saveBlob(zipFileName(), makeZip(zipFiles));
       }
-      if (errors) console.warn(`[Calebe Helper] Downloads concluídos: ${ok} notas, ${errors} erros.`);
+      if (errors) /* console.warn(`[Calebe Helper] Downloads concluídos: ${ok} notas, ${errors} erros.`) */ void 0;
       const finalText = formats.zip
         ? `ZIP concluído: ${ok} notas, ${errors} erros.`
         : `Downloads concluídos: ${ok} notas, ${errors} erros.`;

@@ -90,7 +90,7 @@
 
     for (const callback of [...listeners]) {
       try { callback(detail); }
-      catch (error) { console.error(LOG, 'Erro em um observador de página:', error); }
+      catch (error) { /* console.error(LOG, 'Erro em um observador de página:', error) */ void 0; }
     }
     if (changed) dispatchCompatibilityRefresh();
   }
@@ -111,7 +111,7 @@
         try { doc = frame?.contentDocument || null; } catch (_) {}
         callback({ frame: frame || null, document: doc, url: doc?.location?.href || '' });
       } catch (error) {
-        console.error(LOG, 'Erro ao iniciar observador de página:', error);
+//         console.error(LOG, 'Erro ao iniciar observador de página:', error);
       }
     }
     return () => listeners.delete(callback);
@@ -159,5 +159,5 @@
   window.addEventListener('pageshow', scheduleNotify);
   window.addEventListener('focus', scheduleNotify);
   scheduleNotify();
-  console.info(LOG, `Centralizador ativo (v${VERSION}), compatibilidade legada habilitada.`);
+//   console.info(LOG, `Centralizador ativo (v${VERSION}), compatibilidade legada habilitada.`);
 })();

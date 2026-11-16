@@ -219,9 +219,9 @@
         const link = findNativeMenuLink(config);
 
         if (!link) {
-            console.warn(
-                '[Calebe Helper] Item do menu não encontrado.'
-            );
+//             console.warn(
+//                 '[Calebe Helper] Item do menu não encontrado.'
+//             );
 
             return false;
         }

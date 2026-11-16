@@ -278,7 +278,7 @@
       deleteButton.addEventListener('click', event => {
         event.stopPropagation();
         deleteHistoryItem(item.normalized).catch(error => {
-          console.error('[Calebe Helper] Falha ao excluir item do histórico:', error);
+//           console.error('[Calebe Helper] Falha ao excluir item do histórico:', error);
         });
       }, { signal });
       row.append(chooseButton, deleteButton);
@@ -313,7 +313,7 @@
         }
         historyItems = [];
         persistHistory().then(closeHistory).catch(error => {
-          console.error('[Calebe Helper] Falha ao limpar histórico:', error);
+//           console.error('[Calebe Helper] Falha ao limpar histórico:', error);
         });
       }, { signal });
       historyDropdown.appendChild(clearButton);
@@ -445,7 +445,7 @@
       }
 
       if (seen.size < source.total) {
-        console.warn(`[Calebe Helper] SATGO informou ${source.total} clientes, mas entregou ${seen.size} códigos distintos para esta razão social.`);
+//         console.warn(`[Calebe Helper] SATGO informou ${source.total} clientes, mas entregou ${seen.size} códigos distintos para esta razão social.`);
       }
       return { documents, pagina: source.totalPag };
     }
@@ -637,7 +637,7 @@
         );
         if (persistenceResult.persisted) syncNativeActiveFilters(persistenceResult.parsedDocument);
       } catch (error) {
-        console.error('[Calebe Helper] Falha ao carregar mais clientes:', error);
+//         console.error('[Calebe Helper] Falha ao carregar mais clientes:', error);
       } finally {
         busy = false;
       }
@@ -715,7 +715,7 @@
         if (rows.length) await recordSuccessfulSearch(classification);
         return true;
       } catch (error) {
-        console.error('[Calebe Helper] Falha na pesquisa inteligente de clientes:', error);
+//         console.error('[Calebe Helper] Falha na pesquisa inteligente de clientes:', error);
         return false;
       } finally {
         busy = false;
@@ -742,7 +742,7 @@
       }
       if (doc.activeElement === input) renderHistory();
     }).catch(error => {
-      console.error('[Calebe Helper] Falha ao carregar histórico de clientes:', error);
+//       console.error('[Calebe Helper] Falha ao carregar histórico de clientes:', error);
     });
 
     input.addEventListener('focus', renderHistory, { signal });
@@ -846,7 +846,7 @@
       currentController?.abort();
       currentController = null;
       currentDocument = null;
-      console.error('[Calebe Helper] Falha ao inicializar a pesquisa de clientes:', error);
+//       console.error('[Calebe Helper] Falha ao inicializar a pesquisa de clientes:', error);
       return false;
     }
   }
@@ -889,7 +889,7 @@
       const doc = frame.contentDocument;
       observeFrameDocument(doc);
     } catch (error) {
-      console.error('[Calebe Helper] Falha ao acessar a pesquisa de clientes:', error);
+//       console.error('[Calebe Helper] Falha ao acessar a pesquisa de clientes:', error);
     }
   }
 

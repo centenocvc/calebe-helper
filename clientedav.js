@@ -77,7 +77,7 @@
     try {
       getStorage().setItem(PENDING_KEY, JSON.stringify(pendingClient));
     } catch (error) {
-      console.warn('[Calebe Helper] Não foi possível persistir o cliente do novo DAV.', error);
+//       console.warn('[Calebe Helper] Não foi possível persistir o cliente do novo DAV.', error);
     }
 
     return true;
@@ -162,7 +162,7 @@
       };
 
       createDavForClient(selectedClient).catch(error => {
-        console.error('[Calebe Helper] Falha ao criar o DAV para o cliente selecionado.', error);
+//         console.error('[Calebe Helper] Falha ao criar o DAV para o cliente selecionado.', error);
       });
     });
 
@@ -363,7 +363,7 @@
     if (!isClientLoaded(controls, client)) return false;
     clearPendingClient();
     ensureClientAutocompleteClosed(doc, controls.nameInput, client.code).catch(error => {
-      console.warn('[Calebe Helper] Cliente confirmado, mas o autocomplete não foi fechado.', error);
+//       console.warn('[Calebe Helper] Cliente confirmado, mas o autocomplete não foi fechado.', error);
       if (controls.nameInput.isConnected) controls.nameInput.focus();
     });
     return true;
@@ -392,7 +392,7 @@
   }
 
   async function runOpenBlankDav() {
-    console.log('[CLIENTEDAV] Abrindo listagem de DAVs.');
+//     console.log('[CLIENTEDAV] Abrindo listagem de DAVs.');
     const hostDocument = getHostDocument();
     const davLink = hostDocument.querySelector('#sidebar a.nav-link-l2[href*="modulos/dav01/dav01.php"]');
     if (!davLink) throw new Error('Link DAVs não encontrado no #sidebar.');
@@ -404,9 +404,9 @@
       const candidate = doc?.getElementById('btnNovoDav');
       return doc?.readyState === 'complete' && candidate?.isConnected && !candidate.disabled ? candidate : null;
     }, { message: '#btnNovoDav não ficou disponível.' });
-    console.log('[CLIENTEDAV] #btnNovoDav encontrado.');
+//     console.log('[CLIENTEDAV] #btnNovoDav encontrado.');
     clickNativeElement(button);
-    console.log('[CLIENTEDAV] #btnNovoDav clicado.');
+//     console.log('[CLIENTEDAV] #btnNovoDav clicado.');
     return waitFor(() => {
       const doc = getCalebeDocument();
       const nameInput = doc?.getElementById('cliNome');
@@ -516,7 +516,7 @@
       }
       return true;
     } catch (error) {
-      console.error('[Calebe Helper] Falha ao carregar o cliente no novo DAV.', error);
+//       console.error('[Calebe Helper] Falha ao carregar o cliente no novo DAV.', error);
     }
 
     return false;
@@ -556,7 +556,7 @@
 
       if (!pendingClient || Date.now() - startedAt >= PENDING_TIMEOUT_MS) {
         if (pendingClient) {
-          console.error('[Calebe Helper] A tela do novo DAV não ficou pronta para carregar o cliente.');
+//           console.error('[Calebe Helper] A tela do novo DAV não ficou pronta para carregar o cliente.');
           clearPendingClient();
         } else {
           stopRetrying();
@@ -625,7 +625,7 @@
   if (pendingClient) startRetrying();
   if (false && pendingClient) {
     createDavForClient(pendingClient).catch(error => {
-      console.error('[Calebe Helper] Falha ao restaurar criação pendente.', error);
+//       console.error('[Calebe Helper] Falha ao restaurar criação pendente.', error);
     });
   }
 })();

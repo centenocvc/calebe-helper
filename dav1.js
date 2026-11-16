@@ -6,11 +6,17 @@
   const clientDetails = new Map();
   const failedClientDetails = new Map();
   const CLIENT_DETAIL_RETRY_MS = 60000;
+  const WAIT_SEARCH_RESULT_MS = 2000;
+  const SEARCH_RETRY_MS = 2500;
+  const SEARCH_PAGE_TIMEOUT_MS = 30000;
+  const WAIT_EMIT_FILTER_MS = 400;
   const detailRequests = new Map();
   let observedFrame = null;
   let observedDocument = null;
   let documentObserver = null;
   let pendingCaixaDavId = null;
+  let pendingCaixaSearch = null;
+  let pendingCaixaTimer = 0;
 
   const getFrame = () => document.getElementById('mainIframe');
   const getFrameDocument = () => {
@@ -193,6 +199,72 @@
     }
   }
 
+  function isNfeCaixaDoc(doc) {
+    return /\/modulos\/nfe001\/nfe001\.php$/i.test(String(doc?.location?.pathname || ''));
+  }
+
+  function findEmitCaixaLink(doc, davId) {
+    return [...doc.querySelectorAll('a[onclick*="abrirCaixaDav("]')].find(link => {
+      const match = String(link.getAttribute('onclick') || '').match(/abrirCaixaDav\s*\(\s*(\d+)\s*,\s*1/);
+      return match && Number(match[1]) === davId;
+    }) || null;
+  }
+
+  function davPresentInListing(doc, davId) {
+    const id = Number(davId);
+    if (!Number.isFinite(id)) return false;
+
+    for (const link of doc.querySelectorAll('a[onclick*="abrirCaixaDav("]')) {
+      const match = String(link.getAttribute('onclick') || '').match(/abrirCaixaDav\s*\(\s*(\d+)/);
+      if (match && Number(match[1]) === id) return true;
+    }
+
+    for (const row of doc.querySelectorAll('tr')) {
+      const actions = [
+        row.getAttribute('onclick'),
+        ...[...row.querySelectorAll('[onclick]')].map(element => element.getAttribute('onclick'))
+      ];
+      for (const action of actions) {
+        const match = String(action || '').match(
+          /(?:abrirCaixaDav|duplicarDav|abrirDav|selecionarLinha)\s*\(\s*(?:this\s*,\s*)?(\d+)/
+        );
+        if (match && Number(match[1]) === id) return true;
+      }
+
+      const formatted = String(row.textContent || '').match(/\b\d{3}-(\d{5,})\b/);
+      if (formatted && Number(formatted[1]) === id) return true;
+    }
+
+    return false;
+  }
+
+  function selectEmitMode(doc) {
+    const mode = doc.getElementById('filtAcao');
+    if (!mode) return false;
+    if (String(mode.value || '').toLowerCase() === 'emitir') return false;
+
+    const option = [...mode.options].find(item => String(item.value || '').toLowerCase() === 'emitir')
+      || [...mode.options].find(item => /^\s*emitir\s*$/i.test(String(item.textContent || '')));
+    if (!option) return false;
+
+    mode.value = option.value;
+    mode.dispatchEvent(new doc.defaultView.Event('change', { bubbles: true }));
+    return true;
+  }
+
+  function schedulePendingCaixaCheck(delay = 500) {
+    if (pendingCaixaTimer) window.clearTimeout(pendingCaixaTimer);
+    pendingCaixaTimer = window.setTimeout(() => {
+      pendingCaixaTimer = 0;
+      if (pendingCaixaDavId) observeFrame();
+    }, Math.max(0, Number(delay) || 0));
+  }
+
+  function clearPendingCaixaCheck() {
+    if (pendingCaixaTimer) window.clearTimeout(pendingCaixaTimer);
+    pendingCaixaTimer = 0;
+  }
+
   function openCaixaDav(davId) {
     const id = Number(davId);
     const link = document.querySelector('a[href*="modulos/nfe001/nfe001.php"]');
@@ -200,6 +272,17 @@
       throw new Error('DAV ou link do Emissor NF-e não encontrado.');
     }
     pendingCaixaDavId = id;
+    clearPendingCaixaCheck();
+    pendingCaixaSearch = {
+      createdAt: Date.now(),
+      searchedAt: 0,
+      lastRetryAt: 0,
+      confirmedAt: 0,
+      emitSelectedAt: 0,
+      emitDoc: null,
+      emitSearchedAt: 0,
+      reemitAt: 0,
+    };
     link.click();
     return true;
   }
@@ -225,28 +308,117 @@
         event.preventDefault();
         event.stopPropagation();
         try { requestCaixa(duplicateButton.closest('tr')); }
-        catch (error) { console.error('[Calebe Helper] Falha ao abrir caixa da DAV.', error); }
+        catch (error) { /* console.error('[Calebe Helper] Falha ao abrir caixa da DAV.', error) */ void 0; }
       });
       duplicateButton.insertAdjacentElement('afterend', button);
     }
   }
 
   function openPendingCaixa(doc) {
-    if (!pendingCaixaDavId || !/\/modulos\/nfe001\/nfe001\.php$/i.test(doc.location.pathname)) return;
-    const mode = doc.getElementById('filtAcao');
-    if (mode && mode.value !== 'emitir') {
-      mode.value = 'emitir';
-      mode.dispatchEvent(new doc.defaultView.Event('change', { bubbles: true }));
+    if (!pendingCaixaDavId || !isNfeCaixaDoc(doc)) return;
+
+    const search = pendingCaixaSearch;
+    if (!search) {
+      const link = findEmitCaixaLink(doc, pendingCaixaDavId);
+      if (!link) return;
+      pendingCaixaDavId = null;
+      clearPendingCaixaCheck();
+      link.click();
       return;
     }
-    const nativeLink = [...doc.querySelectorAll('a[onclick*="abrirCaixaDav("]')].find(link => {
-      const match = String(link.getAttribute('onclick') || '').match(/abrirCaixaDav\s*\(\s*(\d+)\s*,\s*1/);
-      return match && Number(match[1]) === pendingCaixaDavId;
-    });
+
+    const now = Date.now();
+    if (now - search.createdAt > SEARCH_PAGE_TIMEOUT_MS) {
+      pendingCaixaDavId = null;
+      pendingCaixaSearch = null;
+      clearPendingCaixaCheck();
+      return;
+    }
+
+    if (!search.searchedAt) {
+      const searchButton = doc.getElementById('btnPesquisar');
+      if (!searchButton || searchButton.disabled) {
+        schedulePendingCaixaCheck(400);
+        return;
+      }
+      search.searchedAt = now;
+      search.lastRetryAt = now;
+      searchButton.click();
+      schedulePendingCaixaCheck(WAIT_SEARCH_RESULT_MS);
+      return;
+    }
+
+    if (!search.confirmedAt) {
+      const remaining = WAIT_SEARCH_RESULT_MS - (now - search.searchedAt);
+      if (remaining > 0) {
+        schedulePendingCaixaCheck(remaining);
+        return;
+      }
+
+      if (davPresentInListing(doc, pendingCaixaDavId)) {
+        search.confirmedAt = now;
+      } else {
+        if (now - search.lastRetryAt >= SEARCH_RETRY_MS) {
+          const searchButton = doc.getElementById('btnPesquisar');
+          if (searchButton && !searchButton.disabled) {
+            search.searchedAt = now;
+            search.lastRetryAt = now;
+            searchButton.click();
+            schedulePendingCaixaCheck(WAIT_SEARCH_RESULT_MS);
+            return;
+          }
+        }
+        schedulePendingCaixaCheck(500);
+        return;
+      }
+    }
+
+    if (!search.emitSelectedAt) {
+      selectEmitMode(doc);
+      search.emitSelectedAt = Date.now();
+      search.emitDoc = doc;
+      schedulePendingCaixaCheck(WAIT_EMIT_FILTER_MS);
+      return;
+    }
+
+    if (search.emitDoc && search.emitDoc !== doc) {
+      search.emitDoc = doc;
+      search.emitSelectedAt = Date.now();
+    }
+
+    const waitEmit = WAIT_EMIT_FILTER_MS - (now - search.emitSelectedAt);
+    if (waitEmit > 0) {
+      schedulePendingCaixaCheck(waitEmit);
+      return;
+    }
+
+    const nativeLink = findEmitCaixaLink(doc, pendingCaixaDavId);
     if (nativeLink) {
       pendingCaixaDavId = null;
+      pendingCaixaSearch = null;
+      clearPendingCaixaCheck();
       nativeLink.click();
+      return;
     }
+
+    if (!search.reemitAt && selectEmitMode(doc)) {
+      search.reemitAt = Date.now();
+      search.emitSelectedAt = Date.now();
+      schedulePendingCaixaCheck(WAIT_EMIT_FILTER_MS);
+      return;
+    }
+
+    if (!search.emitSearchedAt && Date.now() - search.emitSelectedAt >= WAIT_SEARCH_RESULT_MS) {
+      const searchButton = doc.getElementById('btnPesquisar');
+      if (searchButton && !searchButton.disabled) {
+        search.emitSearchedAt = Date.now();
+        searchButton.click();
+        schedulePendingCaixaCheck(WAIT_SEARCH_RESULT_MS);
+        return;
+      }
+    }
+
+    schedulePendingCaixaCheck(500);
   }
 
   function install(doc) {

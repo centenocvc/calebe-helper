@@ -12,6 +12,8 @@
   const SAVE_DAV_GROUP_CLASS = 'calebe-helper-salvar-dav-grupo';
   const LOG = '[Calebe Duplicar]';
   const PENDING_DUPLICATE_KEY = 'calebeHelperPendingDuplicateV2';
+  const FLOW_MAX_AGE_MS = 2 * 60 * 1000;
+  const SAVE_CONFIRM_TIMEOUT_MS = 30 * 1000;
   let duplicateRequestBusy = false;
 
   let observedFrame = null;
@@ -22,6 +24,10 @@
   let overlaySuppressionReason = '';
   let overlayObserver = null;
   let deleteConfirmationDocument = null;
+  let flowTimer = null;
+  let saveWatchTimer = null;
+  let loadHandledDocument = null;
+  let flowFinishing = false;
 
   /* =========================================================
      ARMAZENAMENTO
@@ -52,13 +58,128 @@
     try {
       getStorage().removeItem(FLOW_KEY);
     } catch (_) { }
+    if (flowTimer) {
+      clearTimeout(flowTimer);
+      flowTimer = null;
+    }
+    if (saveWatchTimer) {
+      clearTimeout(saveWatchTimer);
+      saveWatchTimer = null;
+    }
     flowBusy = false;
+    flowFinishing = false;
   }
 
   function patchFlow(patch) {
     const current = readFlow();
     if (!current) return null;
-    return writeFlow({ ...current, ...patch });
+    return writeFlow({ ...current, ...patch, createdAt: Date.now() });
+  }
+
+  function releaseFlowUi(doc) {
+    endOverlaySuppression();
+
+    const target = doc?.documentElement ? doc : getFrameDocument();
+    if (!target?.documentElement) return;
+
+    installEditActions(target);
+    setEditGroupsBusy(target, false);
+  }
+
+  function readActiveFlow() {
+    const flow = readFlow();
+    if (!flow) return null;
+
+    const createdAt = Number(flow.createdAt) || 0;
+    if (!createdAt || Date.now() - createdAt > FLOW_MAX_AGE_MS) {
+//       console.warn(LOG, 'Fluxo de duplicação antigo descartado.');
+      clearFlow();
+      releaseFlowUi(getFrameDocument());
+      return null;
+    }
+
+    return flow;
+  }
+
+  function scheduleFlowExpiry() {
+    if (flowTimer) return;
+
+    const flow = readFlow();
+    if (!flow) return;
+
+    const createdAt = Number(flow.createdAt) || 0;
+    const age = createdAt ? Date.now() - createdAt : FLOW_MAX_AGE_MS;
+    const delay = Math.max(0, FLOW_MAX_AGE_MS - age) + 100;
+
+    flowTimer = setTimeout(() => {
+      flowTimer = null;
+
+      const current = readFlow();
+      if (!current) return;
+
+      if (readActiveFlow()) {
+        scheduleFlowExpiry();
+        return;
+      }
+
+      releaseFlowUi(getFrameDocument());
+//       console.warn(LOG, 'Duplicação não confirmada a tempo. Botões reabilitados.');
+    }, delay);
+  }
+
+  function failFlow(doc, error) {
+    const message = String(error?.message || error || 'Falha na duplicação.');
+    patchFlow({ stage: 'error', error: message });
+    flowBusy = false;
+    endOverlaySuppression();
+    if (doc?.documentElement) {
+      installEditActions(doc);
+      setEditGroupsBusy(doc, false);
+    }
+//     console.error(LOG, message);
+  }
+
+  function flowMatchesClient(flow, clientId) {
+    if (!/^\d+$/.test(String(clientId || ''))) return true;
+
+    return [flow?.originalId, flow?.newId]
+      .map(value => String(value || ''))
+      .some(value => value === String(clientId));
+  }
+
+  function visibleSaveSuccessElements(doc) {
+    const elements = doc?.querySelectorAll?.(
+      '.alert-success, .alert.alert-success, .text-success.alert, .toast, .swal2-popup'
+    ) || [];
+
+    return [...elements].filter(element => {
+      if (!element.getClientRects().length) return false;
+      if (element.classList.contains('swal2-popup') &&
+        !element.querySelector('.swal2-icon-success')) {
+        return false;
+      }
+
+      return /sucesso|salv[oa]|cadastrad[oa]|altera[cç][aã]o/i.test(
+        String(element.textContent || '')
+      );
+    });
+  }
+
+  function captureSaveSuccessSnapshot(doc) {
+    return new Map(
+      visibleSaveSuccessElements(doc).map(element => [
+        element,
+        String(element.textContent || '').trim()
+      ])
+    );
+  }
+
+  function hasNewSaveSuccess(doc, known) {
+    return visibleSaveSuccessElements(doc).some(element => {
+      const previous = known.get(element);
+      if (previous === undefined) return true;
+      return previous !== String(element.textContent || '').trim();
+    });
   }
 
 
@@ -100,6 +221,18 @@
     }
 
     return value;
+  }
+
+  function readPendingDavAfterSave() {
+    const pending = readJsonStorage(PENDING_DAV_AFTER_SAVE_KEY);
+    if (!pending || !/^\d+$/.test(String(pending.id || ''))) return null;
+
+    if (Date.now() - Number(pending.createdAt || 0) > 2 * 60 * 1000) {
+      removeStorageKey(PENDING_DAV_AFTER_SAVE_KEY);
+      return null;
+    }
+
+    return pending;
   }
 
   /* =========================================================
@@ -530,6 +663,23 @@
     return url;
   }
 
+  function fetchWithTimeout(win, url, options = {}, timeoutMs = 20000) {
+    const Controller = win?.AbortController || AbortController;
+    const controller = Controller ? new Controller() : null;
+    const timer = controller
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
+
+    const request = (win?.fetch || fetch)(url, {
+      ...options,
+      ...(controller ? { signal: controller.signal } : {})
+    });
+
+    return request.finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+  }
+
   async function queryDuplicateClients(doc, field, term, page = 1) {
     const url = duplicateEndpoint(doc);
     url.searchParams.set('campo', field);
@@ -538,7 +688,8 @@
     url.searchParams.set('fmt', 'json');
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const response = await (doc.defaultView || window).fetch(url.href, {
+        const win = doc.defaultView || window;
+        const response = await fetchWithTimeout(win, url.href, {
           credentials: 'same-origin', cache: 'no-store'
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -565,7 +716,7 @@
     
     const emptyLimit = 30;    // Limite de segurança contra buracos falsos
     
-    console.info(LOG, `Iniciando Busca Exponencial Suprema a partir do Storage: ${knownHighest}.`);
+//     console.info(LOG, `Iniciando Busca Exponencial Suprema a partir do Storage: ${knownHighest}.`);
 
     let step = 1;
     let lastFoundOcupado = knownHighest;
@@ -581,12 +732,12 @@
         lastFoundOcupado = currentCheck;
         highestRow = row;
         
-        console.info(LOG, `ID ${currentCheck} ocupado. Dobrando o passo de ${step} para ${step * 2}.`);
+//         console.info(LOG, `ID ${currentCheck} ocupado. Dobrando o passo de ${step} para ${step * 2}.`);
         step *= 2; // Dobra o tamanho do salto
         currentCheck = lastFoundOcupado + step;
       } else {
         // Encontramos um código vago! O teto está entre o último ocupado e este chute atual
-        console.info(LOG, `ID ${currentCheck} está vago. Teto encontrado! Refinando intervalo.`);
+//         console.info(LOG, `ID ${currentCheck} está vago. Teto encontrado! Refinando intervalo.`);
         break;
       }
     }
@@ -595,7 +746,7 @@
     let low = lastFoundOcupado;
     let high = currentCheck;
 
-    console.info(LOG, `Iniciando Busca Binária entre os IDs ${low} e ${high}.`);
+//     console.info(LOG, `Iniciando Busca Binária entre os IDs ${low} e ${high}.`);
 
     while (low <= high) {
       let mid = Math.floor((low + high) / 2);
@@ -620,7 +771,7 @@
     }
 
     // FASE 3: Varredura de segurança contra pequenos buracos falsos no fim da linha
-    console.info(LOG, `Aplicando margem de segurança linear a partir de ${lastFoundOcupado}.`);
+//     console.info(LOG, `Aplicando margem de segurança linear a partir de ${lastFoundOcupado}.`);
     let linearCheck = lastFoundOcupado + 1;
     let consecutiveEmpty = 0;
 
@@ -639,7 +790,7 @@
     }
 
     if (highestRow) {
-      console.info(LOG, `[SUCESSO] Maior código absoluto cravado: ${highestRow.ClienteCodigo}`);
+//       console.info(LOG, `[SUCESSO] Maior código absoluto cravado: ${highestRow.ClienteCodigo}`);
       
       // 2. SALVAR NO STORAGE: Grava o novo maior ID absoluto encontrado.
       // Na próxima vez que você duplicar um cliente, ele não começará do 708, mas sim deste novo número!
@@ -665,10 +816,10 @@
       removeStorageKey(PENDING_DUPLICATE_KEY);
       const pending = { originalId: String(originalId), confirmed: false, startedAt: Date.now(), mode: 'highest-code' };
       writeJsonStorage(pendingKey, pending);
-      console.info(LOG, `Solicitando ao SATGO a duplicação do cliente ${originalId}.`);
-      const response = await (doc.defaultView || window).fetch(duplicateEndpoint(doc).href, {
+//       console.info(LOG, `Solicitando ao SATGO a duplicação do cliente ${originalId}.`);
+      const response = await fetchWithTimeout(doc.defaultView || window, duplicateEndpoint(doc).href, {
         method: 'POST', body: data, credentials: 'same-origin'
-      });
+      }, 45000);
       const text = await response.text();
       let payload = null;
       try { payload = JSON.parse(text); } catch (_) { }
@@ -692,10 +843,10 @@
       if (!pending.confirmed) {
         throw new Error('O SATGO não confirmou a operação na resposta recebida. O pedido foi guardado e não será reenviado automaticamente.');
       }
-      console.info(LOG, 'Duplicação confirmada. Buscando o maior código disponível.');
+//       console.info(LOG, 'Duplicação confirmada. Buscando o maior código disponível.');
       const created = await findHighestAvailableClient(doc);
       const newId = String(created.ClienteCodigo);
-      console.info(LOG, `Maior código localizado: ${newId}. Conferindo CPF/CNPJ e endereço.`);
+//       console.info(LOG, `Maior código localizado: ${newId}. Conferindo CPF/CNPJ e endereço.`);
       const originalResult = await queryDuplicateClients(doc, 'ClienteCodigo', String(originalId));
       const original = originalResult.rows.find(row => String(row.ClienteCodigo) === String(originalId));
       if (newId === String(originalId) || !original || !normalizeDuplicateText(original.ClienteLogradouro) ||
@@ -730,7 +881,7 @@
     try {
       const data = buildDuplicateFormDataFromList(doc, client.id);
       const { newId, editUrl } = await duplicateAndResolve(doc, client.id, data);
-      console.info(LOG, `Cliente ${client.id} duplicado como ${newId}; abrindo edição.`);
+//       console.info(LOG, `Cliente ${client.id} duplicado como ${newId}; abrindo edição.`);
       navigateFrame(editUrl);
       endOverlaySuppression('duplicate');
     } catch (error) {
@@ -755,7 +906,7 @@
         event.stopImmediatePropagation();
 
         duplicateFromListAndOpen(button).catch(error => {
-          console.error(LOG, 'Falha ao concluir a duplicação pela listagem. Consulte a etapa informada abaixo.', error);
+//           console.error(LOG, 'Falha ao concluir a duplicação pela listagem. Consulte a etapa informada abaixo.', error);
         });
       }, true);
     }
@@ -778,7 +929,7 @@
 
       const listUrl = findClientListUrl(doc);
       if (!listUrl) {
-        console.error(LOG, 'Não foi possível localizar a listagem para excluir o duplicado.');
+//         console.error(LOG, 'Não foi possível localizar a listagem para excluir o duplicado.');
         return;
       }
 
@@ -788,11 +939,19 @@
       });
 
       beginOverlaySuppression('delete');
-      console.info(LOG, `Abrindo exclusão nativa do cliente duplicado ${clientId}.`);
+//       console.info(LOG, `Abrindo exclusão nativa do cliente duplicado ${clientId}.`);
       navigateFrame(listUrl);
     });
 
     return button;
+  }
+
+  function setSaveDavBusy(doc, busy) {
+    for (const group of doc.querySelectorAll(`.${SAVE_DAV_GROUP_CLASS}`)) {
+      group.classList.toggle('calebe-flow-busy', busy);
+      const dav = group.querySelector('.calebe-salvar-dav');
+      if (dav) dav.disabled = busy;
+    }
   }
 
   function saveDuplicatedAndOpenDav(doc, clientId) {
@@ -804,15 +963,79 @@
       createdAt: Date.now()
     });
 
-    const groups = doc.querySelectorAll(`.${SAVE_DAV_GROUP_CLASS}`);
-    for (const group of groups) {
-      group.classList.add('calebe-flow-busy');
-      const dav = group.querySelector('.calebe-salvar-dav');
-      if (dav) dav.disabled = true;
+    setSaveDavBusy(doc, true);
+
+//     console.info(LOG, `Salvando cliente ${clientId} antes de abrir o DAV.`);
+
+    try {
+      dispatchNativeSave(doc);
+    } catch (error) {
+      removeStorageKey(PENDING_DAV_AFTER_SAVE_KEY);
+      setSaveDavBusy(doc, false);
+      throw error;
     }
 
-    console.info(LOG, `Salvando cliente ${clientId} antes de abrir o DAV.`);
-    dispatchNativeSave(doc);
+    schedulePendingDavWatch(doc);
+  }
+
+  function schedulePendingDavWatch(doc) {
+    const pending = readJsonStorage(PENDING_DAV_AFTER_SAVE_KEY);
+    if (!pending) return;
+
+    const knownSuccess = captureSaveSuccessSnapshot(doc);
+    const startedAt = Date.now();
+
+    if (saveWatchTimer) {
+      clearTimeout(saveWatchTimer);
+      saveWatchTimer = null;
+    }
+
+    const check = () => {
+      saveWatchTimer = null;
+
+      if (getFrameDocument() !== doc) {
+        if (Date.now() - startedAt < SAVE_CONFIRM_TIMEOUT_MS) {
+          saveWatchTimer = setTimeout(check, 300);
+        } else {
+          removeStorageKey(PENDING_DAV_AFTER_SAVE_KEY);
+          setSaveDavBusy(doc, false);
+        }
+        return;
+      }
+
+      const current = readJsonStorage(PENDING_DAV_AFTER_SAVE_KEY);
+      if (!current) return;
+
+      if (Date.now() - Number(current.createdAt || 0) > 2 * 60 * 1000) {
+        removeStorageKey(PENDING_DAV_AFTER_SAVE_KEY);
+        setSaveDavBusy(doc, false);
+        return;
+      }
+
+      if (hasVisibleSaveError(doc)) {
+        removeStorageKey(PENDING_DAV_AFTER_SAVE_KEY);
+        setSaveDavBusy(doc, false);
+//         console.error(LOG, 'O SATGO exibiu erro ao salvar; o DAV não foi aberto.');
+        return;
+      }
+
+      const succeeded = hasNewSaveSuccess(doc, knownSuccess);
+      if (succeeded) {
+        executePendingDavAfterSave(doc, { fromLoad: true }).catch(handleFlowError);
+        return;
+      }
+
+      if (Date.now() - startedAt < SAVE_CONFIRM_TIMEOUT_MS) {
+        saveWatchTimer = setTimeout(check, 300);
+        return;
+      }
+
+      removeStorageKey(PENDING_DAV_AFTER_SAVE_KEY);
+      setSaveDavBusy(doc, false);
+//       console.error(LOG, 'O salvamento não foi confirmado a tempo; o DAV não foi aberto.');
+    };
+
+    saveWatchTimer = setTimeout(check, 300);
   }
 
   function createSaveDavButton(doc, clientId) {
@@ -830,7 +1053,8 @@
         saveDuplicatedAndOpenDav(doc, clientId);
       } catch (error) {
         removeStorageKey(PENDING_DAV_AFTER_SAVE_KEY);
-        console.error(LOG, 'Falha ao salvar e abrir DAV.', error);
+        setSaveDavBusy(doc, false);
+//         console.error(LOG, 'Falha ao salvar e abrir DAV.', error);
       }
     });
 
@@ -839,7 +1063,7 @@
 
   function installDuplicatedEditActions(doc, currentId) {
     const saveButtons = [...doc.querySelectorAll('button.btn.btn-primary')]
-      .filter(button => /Salvar Alterações/i.test(button.textContent || ''));
+      .filter(button => isNativeSaveButton(doc, button));
 
     /* Nesta tela especial não oferecemos Duplicar novamente. */
     doc.querySelectorAll(`.${EDIT_GROUP_CLASS}`).forEach(group => group.remove());
@@ -876,13 +1100,20 @@
 
     if (Date.now() - Number(pending.createdAt || 0) > 2 * 60 * 1000) {
       removeStorageKey(PENDING_DAV_AFTER_SAVE_KEY);
+      setSaveDavBusy(doc, false);
       return false;
     }
 
-    if (hasVisibleSaveError(doc)) {
+    /* O salvamento só pode terminar em uma tela de cliente (edição ou listagem). */
+    if (!doc.getElementById('formClifor') && !isClientListPage(doc)) {
+//       console.info(LOG, 'DAV pendente ignorado: o iframe não está em uma tela de cliente.');
+      return false;
+    }
+
+    if (!isClientListPage(doc) && hasVisibleSaveError(doc)) {
       removeStorageKey(PENDING_DAV_AFTER_SAVE_KEY);
       setEditGroupsBusy(doc, false);
-      console.error(LOG, 'O SATGO exibiu erro ao salvar; o DAV não foi aberto.');
+//       console.error(LOG, 'O SATGO exibiu erro ao salvar; o DAV não foi aberto.');
       return false;
     }
 
@@ -890,19 +1121,20 @@
     if (!api?.createDavForClient) {
       removeStorageKey(PENDING_DAV_AFTER_SAVE_KEY);
       setEditGroupsBusy(doc, false);
-      console.error(LOG, 'clientedav.js não disponibilizou createDavForClient().');
+//       console.error(LOG, 'clientedav.js não disponibilizou createDavForClient().');
       return false;
     }
 
     removeStorageKey(PENDING_DAV_AFTER_SAVE_KEY);
-    removeStorageKey(DUPLICATED_EDIT_KEY);
-    console.info(LOG, `Cliente ${pending.id} salvo; abrindo novo DAV.`);
+//     console.info(LOG, `Cliente ${pending.id} salvo; abrindo novo DAV.`);
 
     try {
       await api.createDavForClient({ code: String(pending.id), name: '' });
+      removeStorageKey(DUPLICATED_EDIT_KEY);
       return true;
     } catch (error) {
-      console.error(LOG, 'Falha ao abrir DAV após salvar o cliente duplicado.', error);
+      setSaveDavBusy(doc, false);
+//       console.error(LOG, 'Falha ao abrir DAV após salvar o cliente duplicado.', error);
       return false;
     }
   }
@@ -930,7 +1162,7 @@
     beginOverlaySuppression('delete');
     hideBlockingOverlay();
     deleteConfirmationDocument = doc;
-    console.info(LOG, `Abrindo confirmação nativa de exclusão do cliente ${pending.id}.`);
+//     console.info(LOG, `Abrindo confirmação nativa de exclusão do cliente ${pending.id}.`);
     deleteButton.click();
     hideBlockingOverlay();
     return true;
@@ -947,7 +1179,7 @@
     for (const el of Array.from(form.elements || [])) {
       const name = String(el.name || '').trim();
       if (!name) continue;
-      if (['acao', 'id', 'chave'].includes(name)) continue;
+      if (['acao', 'id', 'chave', 'ClienteCodigo'].includes(name)) continue;
 
       const type = String(el.type || '').toLowerCase();
       if (['button', 'submit', 'reset', 'file'].includes(type)) continue;
@@ -1072,7 +1304,7 @@
       installDuplicatedEditActions(doc, clientId);
     } else {
       const saveButtons = [...doc.querySelectorAll('button.btn.btn-primary')]
-        .filter(button => /Salvar Alterações/i.test(button.textContent || ''));
+        .filter(button => isNativeSaveButton(doc, button));
 
       for (const saveButton of saveButtons) {
         const container = saveButton.parentElement;
@@ -1086,8 +1318,20 @@
       }
     }
 
-    const flow = readFlow();
+    let flow = readActiveFlow();
+    if (
+      flow &&
+      !['opening-dav', 'reopening-duplicate'].includes(flow.stage) &&
+      !flowMatchesClient(flow, clientId)
+    ) {
+//       console.warn(LOG, 'Cliente aberto não pertence ao fluxo de duplicação; estado descartado.');
+      clearFlow();
+      endOverlaySuppression();
+      flow = null;
+    }
+
     setEditGroupsBusy(doc, Boolean(flow && flow.stage !== 'error'));
+    setSaveDavBusy(doc, Boolean(readPendingDavAfterSave()));
   }
 
   /* =========================================================
@@ -1124,10 +1368,10 @@
      ========================================================= */
 
   async function startDuplicateFlow(mode, doc) {
-    const existingFlow = readFlow();
+    const existingFlow = readActiveFlow();
 
     if (flowBusy || (existingFlow && existingFlow.stage !== 'error')) {
-      console.warn(LOG, 'Já existe um fluxo de duplicação em andamento.');
+//       console.warn(LOG, 'Já existe um fluxo de duplicação em andamento.');
       return;
     }
 
@@ -1146,27 +1390,29 @@
     setEditGroupsBusy(doc, true);
     beginOverlaySuppression('duplicate');
 
-    const snapshot = captureClientSnapshot(form);
-    let flow = writeFlow({
-      version: 1,
-      mode,
-      originalId,
-      newId: null,
-      editUrl: null,
-      snapshot,
-      stage: 'duplicating',
-      createdAt: Date.now()
-    });
-
     try {
+      const snapshot = captureClientSnapshot(form);
+      const flow = writeFlow({
+        version: 1,
+        mode,
+        originalId,
+        newId: null,
+        editUrl: null,
+        snapshot,
+        stage: 'duplicating',
+        createdAt: Date.now()
+      });
+
+      scheduleFlowExpiry();
+
       const duplicated = await duplicateOriginalClient(doc, flow);
-      flow = patchFlow({
+      const nextFlow = patchFlow({
         newId: duplicated.newId,
         editUrl: duplicated.editUrl,
         stage: 'opening-duplicate'
       });
 
-      if (!flow) throw new Error('Estado da duplicação foi perdido após criar o novo cliente.');
+      if (!nextFlow) throw new Error('Estado da duplicação foi perdido após criar o novo cliente.');
       endOverlaySuppression('duplicate');
       navigateFrame(duplicated.editUrl);
     } catch (error) {
@@ -1179,106 +1425,240 @@
   }
 
   function hasVisibleSaveError(doc) {
-    return Boolean(doc.querySelector(
-      '.alert-danger, .alert-error, .alert.alert-danger, .text-danger.alert'
-    ));
+    const elements = doc.querySelectorAll(
+      '.alert-danger, .alert-error, .alert.alert-danger, .text-danger.alert, ' +
+      '.invalid-feedback, .is-invalid'
+    );
+
+    for (const element of elements) {
+      if (!element.getClientRects || !element.getClientRects().length) continue;
+      if (element.classList.contains('is-invalid')) return true;
+      if (String(element.textContent || '').trim()) return true;
+    }
+
+    return false;
+  }
+
+  function isClientListPage(doc) {
+    if (!doc?.documentElement) return false;
+
+    try {
+      if (/\/clca01\.php$/i.test(new URL(doc.location.href).pathname)) return true;
+    } catch (_) {}
+
+    return Boolean(
+      doc.getElementById('formFiltro') &&
+      doc.querySelector('input[name="q"]')
+    );
+  }
+
+  function normalizeButtonText(button) {
+    return String(button?.textContent || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function isNativeSaveButton(doc, button) {
+    if (!button || !button.getClientRects().length) return false;
+    if (!/^Salvar(?:\s+Alterac(?:ao|oes))?$/i.test(normalizeButtonText(button))) return false;
+
+    const form = doc.getElementById('formClifor');
+    if (!form) return false;
+
+    const onclick = String(button.getAttribute('onclick') || '');
+    return form.contains(button) || onclick.includes('formClifor');
+  }
+
+  function findNativeSaveButton(doc) {
+    return [...doc.querySelectorAll('button.btn.btn-primary')]
+      .find(button => isNativeSaveButton(doc, button)) || null;
   }
 
   function dispatchNativeSave(doc) {
     const form = doc.getElementById('formClifor');
     if (!form) throw new Error('#formClifor não encontrado no cliente duplicado.');
 
-    const win = doc.defaultView || window;
-    const event = new win.Event('submit', {
-      bubbles: true,
-      cancelable: true
-    });
+    const nativeSave = findNativeSaveButton(doc);
+    if (!nativeSave) {
+      throw new Error('O botão nativo "Salvar Alterações" não está disponível.');
+    }
 
-    form.dispatchEvent(event);
+    nativeSave.click();
   }
 
-  function handleOpenedDuplicate(doc, flow) {
+  function waitForDuplicateForm(doc, flow, timeout = 10000) {
+    const expectedId = String(flow.newId || '');
+    const startedAt = Date.now();
+
+    return new Promise((resolve, reject) => {
+      const check = () => {
+        if (getFrameDocument() !== doc) {
+          reject(new Error('A página do cliente duplicado foi substituída antes do salvamento.'));
+          return;
+        }
+
+        const form = doc.getElementById('formClifor');
+        const currentId = getCurrentClientId(doc);
+        const saveButton = findNativeSaveButton(doc);
+
+        if (doc.readyState === 'complete' && form && currentId === expectedId && saveButton) {
+          resolve({ form, saveButton });
+          return;
+        }
+
+        if (Date.now() - startedAt >= timeout) {
+          reject(new Error('A tela do cliente duplicado não ficou pronta para salvar.'));
+          return;
+        }
+
+        setTimeout(check, 100);
+      };
+
+      check();
+    });
+  }
+
+  function scheduleSaveWatch(doc, flow, knownSuccess) {
+    if (saveWatchTimer) {
+      clearTimeout(saveWatchTimer);
+      saveWatchTimer = null;
+    }
+
+    const startedAt = Date.now();
+
+    const check = () => {
+      saveWatchTimer = null;
+
+      if (getFrameDocument() !== doc) return;
+
+      const currentFlow = readFlow();
+      if (!currentFlow || currentFlow.stage !== 'saving-duplicate') return;
+
+      if (hasVisibleSaveError(doc)) {
+        failFlow(doc, new Error('O SATGO exibiu erro ao salvar o cliente duplicado.'));
+        return;
+      }
+
+      const succeeded = hasNewSaveSuccess(doc, knownSuccess);
+      if (succeeded) {
+        finishAfterSave(doc, currentFlow).catch(handleFlowError);
+        return;
+      }
+
+      if (Date.now() - startedAt < SAVE_CONFIRM_TIMEOUT_MS) {
+        saveWatchTimer = setTimeout(check, 300);
+        return;
+      }
+
+      failFlow(doc, new Error('O salvamento do cliente duplicado não foi confirmado a tempo.'));
+    };
+
+    saveWatchTimer = setTimeout(check, 300);
+  }
+
+  async function handleOpenedDuplicate(doc, flow) {
     const currentId = getCurrentClientId(doc);
     if (currentId !== String(flow.newId || '')) return false;
 
     const form = doc.getElementById('formClifor');
     if (!form) return false;
 
-    console.info(LOG, `Restaurando alterações no cliente duplicado ${flow.newId}.`);
-    restoreClientSnapshot(form, flow.snapshot);
+    patchFlow({ stage: 'preparing-duplicate' });
+    scheduleFlowExpiry();
 
-    patchFlow({ stage: 'saving-duplicate' });
-    setEditGroupsBusy(doc, true);
+//     console.info(LOG, `Restaurando alterações no cliente duplicado ${flow.newId}.`);
 
-    console.info(LOG, `Salvando alterações no cliente duplicado ${flow.newId}.`);
-    dispatchNativeSave(doc);
-    return true;
+    try {
+      const ready = await waitForDuplicateForm(doc, flow);
+      if (!readFlow()) return false;
+
+      restoreClientSnapshot(ready.form, flow.snapshot);
+      await new Promise(resolve => setTimeout(resolve, 150));
+      restoreClientSnapshot(ready.form, flow.snapshot);
+
+      const knownSuccess = captureSaveSuccessSnapshot(doc);
+      patchFlow({ stage: 'saving-duplicate' });
+      setEditGroupsBusy(doc, true);
+
+//       console.info(LOG, `Salvando alterações no cliente duplicado ${flow.newId}.`);
+      dispatchNativeSave(doc);
+      scheduleSaveWatch(doc, flow, knownSuccess);
+      return true;
+    } catch (error) {
+      failFlow(doc, error);
+      return false;
+    }
   }
 
   async function finishAfterSave(doc, flow) {
-    if (hasVisibleSaveError(doc)) {
-      patchFlow({ stage: 'error', error: 'O SATGO exibiu erro ao salvar o cliente duplicado.' });
-      flowBusy = false;
-      setEditGroupsBusy(doc, false);
-      console.error(LOG, 'O cliente duplicado não foi considerado salvo porque a página exibiu um erro.');
-      return;
-    }
+    if (flowFinishing) return;
+    flowFinishing = true;
 
-    if (flow.mode === 'duplicate-and-dav') {
-      const api = window.calebeHelperClientDav;
-      if (!api?.createDavForClient) {
-        patchFlow({ stage: 'error', error: 'API calebeHelperClientDav.createDavForClient não disponível.' });
-        flowBusy = false;
-        setEditGroupsBusy(doc, false);
-        console.error(LOG, 'clientedav.js não disponibilizou createDavForClient().');
+    try {
+      if (!isClientListPage(doc) && hasVisibleSaveError(doc)) {
+        failFlow(doc, new Error('O SATGO exibiu erro ao salvar o cliente duplicado.'));
         return;
       }
 
-      patchFlow({ stage: 'opening-dav' });
-      console.info(LOG, `Abrindo novo DAV para o cliente ${flow.newId}.`);
+      if (flow.mode === 'duplicate-and-dav') {
+        const api = window.calebeHelperClientDav;
+        if (!api?.createDavForClient) {
+          failFlow(doc, new Error('API calebeHelperClientDav.createDavForClient não disponível.'));
+          return;
+        }
 
-      try {
-        await api.createDavForClient({ code: String(flow.newId), name: '' });
-        clearFlow();
-        console.info(LOG, `Novo DAV aberto com o cliente ${flow.newId}.`);
-      } catch (error) {
-        patchFlow({ stage: 'error', error: String(error?.message || error) });
-        flowBusy = false;
-        console.error(LOG, 'Falha ao abrir DAV para o cliente duplicado.', error);
+        patchFlow({ stage: 'opening-dav' });
+        endOverlaySuppression('duplicate');
+//         console.info(LOG, `Abrindo novo DAV para o cliente ${flow.newId}.`);
+
+        try {
+          await api.createDavForClient({ code: String(flow.newId), name: '' });
+          clearFlow();
+          setEditGroupsBusy(doc, false);
+//           console.info(LOG, `Novo DAV aberto com o cliente ${flow.newId}.`);
+        } catch (error) {
+          failFlow(doc, error);
+//           console.error(LOG, 'Falha ao abrir DAV para o cliente duplicado.', error);
+        }
+        return;
       }
-      return;
-    }
 
-    const currentId = getCurrentClientId(doc);
-    if (currentId === String(flow.newId)) {
-      clearFlow();
-      installEditActions(doc);
-      setEditGroupsBusy(doc, false);
-      console.info(LOG, `Duplicação concluída. Permanecendo no cliente ${flow.newId}.`);
-      return;
-    }
+      const currentId = getCurrentClientId(doc);
+      if (currentId === String(flow.newId)) {
+        clearFlow();
+        endOverlaySuppression('duplicate');
+        installEditActions(doc);
+        setEditGroupsBusy(doc, false);
+//         console.info(LOG, `Duplicação concluída. Permanecendo no cliente ${flow.newId}.`);
+        return;
+      }
 
-    if (flow.editUrl) {
-      patchFlow({ stage: 'reopening-duplicate' });
-      navigateFrame(flow.editUrl);
-      return;
-    }
+      if (flow.editUrl) {
+        patchFlow({ stage: 'reopening-duplicate' });
+        navigateFrame(flow.editUrl);
+        return;
+      }
 
-    patchFlow({ stage: 'error', error: 'Não foi possível retornar ao cliente duplicado após salvar.' });
-    flowBusy = false;
+      failFlow(doc, new Error('Não foi possível retornar ao cliente duplicado após salvar.'));
+    } finally {
+      flowFinishing = false;
+    }
   }
 
   function finishReopen(doc, flow) {
     if (getCurrentClientId(doc) !== String(flow.newId || '')) return false;
     clearFlow();
+    endOverlaySuppression('duplicate');
     installEditActions(doc);
     setEditGroupsBusy(doc, false);
-    console.info(LOG, `Duplicação concluída. Cliente ${flow.newId} aberto.`);
+//     console.info(LOG, `Duplicação concluída. Cliente ${flow.newId} aberto.`);
     return true;
   }
 
   function handleFlowError(error) {
-    console.error(LOG, error);
+//     console.error(LOG, error);
   }
 
   /* =========================================================
@@ -1295,36 +1675,42 @@
     executePendingNativeDelete(doc);
     executePendingDavAfterSave(doc, { fromLoad }).catch(handleFlowError);
 
-    const flow = readFlow();
+    const flow = readActiveFlow();
     if (!flow || flow.stage === 'error') return;
 
+    scheduleFlowExpiry();
     flowBusy = true;
     setEditGroupsBusy(doc, true);
 
     try {
       if (flow.stage === 'opening-duplicate') {
-        handleOpenedDuplicate(doc, flow);
+        if (!fromLoad) return;
+        handleOpenedDuplicate(doc, flow).catch(handleFlowError);
         return;
       }
 
       /*
        * A etapa de salvamento só avança em um NOVO load do iframe.
        * Isso impede que o mesmo documento finalize o fluxo logo após
-       * dispararmos o submit nativo.
+       * dispararmos o submit nativo. Salvamentos sem navegação (AJAX)
+       * são confirmados pelo scheduleSaveWatch().
        */
       if (flow.stage === 'saving-duplicate' && fromLoad) {
+        const clientId = getCurrentClientId(doc);
+        if (!isClientListPage(doc) && clientId !== String(flow.newId || '')) {
+//           console.info(LOG, 'Load ignorado: o iframe não está na tela do cliente duplicado.');
+          return;
+        }
+
         finishAfterSave(doc, flow).catch(handleFlowError);
         return;
       }
 
-      if (flow.stage === 'reopening-duplicate') {
+      if (flow.stage === 'reopening-duplicate' && fromLoad) {
         finishReopen(doc, flow);
       }
     } catch (error) {
-      patchFlow({ stage: 'error', error: String(error?.message || error) });
-      flowBusy = false;
-      setEditGroupsBusy(doc, false);
-      console.error(LOG, error);
+      failFlow(doc, error);
     }
   }
 
@@ -1352,17 +1738,36 @@
     });
   }
 
+  function handleFrameLoad(doc) {
+    if (!doc?.documentElement || doc.readyState !== 'complete') return false;
+    if (loadHandledDocument === doc) return false;
+
+    loadHandledDocument = doc;
+    handleCurrentFrame({ fromLoad: true });
+    return true;
+  }
+
   function bindCurrentFrame() {
     const frame = getMainFrame();
     if (!frame) return;
 
     if (frame !== observedFrame) {
       observedFrame = frame;
-      frame.addEventListener('load', () => {
+      frame.addEventListener('load', event => {
+        /*
+         * O CalebeCore dispara eventos "load" sintéticos no iframe ao trocar
+         * de aba. Tratá-los como navegação real adiantava o salvamento e
+         * consumia o fluxo antes do SATGO concluir o submit.
+         */
+        if (!event.isTrusted) return;
+
         const doc = getFrameDocument();
         const previousDeleteDocument = deleteConfirmationDocument;
         if (doc && doc !== observedFrameDocument) observeFrameDocument(doc);
-        handleCurrentFrame({ fromLoad: true });
+
+        if (!handleFrameLoad(doc)) {
+          setTimeout(() => handleFrameLoad(getFrameDocument()), 50);
+        }
 
         if (
           overlaySuppressionReason === 'delete' &&
@@ -1378,6 +1783,7 @@
 
     const doc = getFrameDocument();
     if (doc && doc !== observedFrameDocument) observeFrameDocument(doc);
+    handleFrameLoad(doc);
     handleCurrentFrame({ fromLoad: false });
   }
 
@@ -1387,6 +1793,11 @@
 
   ensureOverlayObserver();
   bindCurrentFrame();
+
+  window.addEventListener('pageshow', () => {
+    bindCurrentFrame();
+    handleCurrentFrame({ fromLoad: false });
+  });
 
   new MutationObserver(bindCurrentFrame).observe(document.documentElement, {
     childList: true,

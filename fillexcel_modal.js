@@ -4,6 +4,9 @@
   if (document.getElementById('calebe-helper-root')) return;
 
   const STORAGE_KEY = 'calebeHelperStateV3';
+  const EMIT_STORAGE_KEY = 'calebeHelperEmitirNotaAutomaticamente';
+  const EMISSION_WINDOW_WAIT_MS = 60000;
+  const EMISSION_WINDOW_SETTLE_MS = 800;
   const DEFAULTS = {
     cpf: false,
     cnpj: false,
@@ -26,6 +29,9 @@
   };
   let lastPanelPointerAt = 0;
   let autoMinimizedPanel = false;
+  let emissionWait = null;
+  let emissionCandidate = null;
+  const emissionPopups = new Map();
 
   function extensionContextValid() {
     try {
@@ -209,6 +215,10 @@
       if (row.ClienteCodigo) state.clientDetails.set(String(row.ClienteCodigo), row);
       renderClientOverlay(row);
     });
+    doc.addEventListener('calebe-helper:window-opened', e => onEmissionWindowOpened(e.detail));
+    doc.addEventListener('calebe-helper:window-url', e => onEmissionWindowUrl(e.detail));
+    doc.addEventListener('calebe-helper:window-closed', e => onEmissionWindowClosed(e.detail));
+    doc.addEventListener('calebe-helper:emission-confirmed', () => restoreAfterEmission());
   }
 
   function command(action, payload = {}, timeout = 3000) {
@@ -545,7 +555,7 @@
       let details = await waitFor(() => state.clientDetails.get(expected) || readClientDetailsFromBridge(expected), { timeout: 1800, message: 'detalhes' });
       renderClientOverlay(details);
     } catch (_) {
-      console.warn('[Calebe Helper] Cliente confirmado, mas detalhes/endereço não foram capturados:', _);
+//       console.warn('[Calebe Helper] Cliente confirmado, mas detalhes/endereço não foram capturados:', _);
     }
     await dismissNoClientMessage();
   }
@@ -824,7 +834,7 @@
           }
         }
       } catch (error) {
-        console.warn('[Calebe Helper] Acompanhamento dos itens aguardando a confirmação do lançamento:', error);
+//         console.warn('[Calebe Helper] Acompanhamento dos itens aguardando a confirmação do lançamento:', error);
       }
     }, 250);
   }
@@ -878,23 +888,24 @@
     state.selectedIndex = index;
     if (!row.clientCode) {
       if (isNewEnabled(row)) {
-        console.warn(`[Calebe Helper] Linha ${index + 1}: ${row.type} sem código — novo cadastro ainda será implementado. DAV não iniciada.`);
-      } else console.warn(`[Calebe Helper] Linha ${index + 1}: cliente sem código e tipo não habilitado.`);
+//         console.warn(`[Calebe Helper] Linha ${index + 1}: ${row.type} sem código — novo cadastro ainda será implementado. DAV não iniciada.`);
+      } else /* console.warn(`[Calebe Helper] Linha ${index + 1}: cliente sem código e tipo não habilitado.`) */ void 0;
       return;
     }
 
     state.busy = true;
     renderRows();
     minimizePanelForFill();
+    let davCloseRequested = false;
     try {
-      console.log('[FLUXO PREENCHER] Preencher acionado.');
+//       console.log('[FLUXO PREENCHER] Preencher acionado.');
       status(`Linha ${index + 1}: criando nova DAV...`);
       await openBlankDavThroughClientDav();
       status(`Linha ${index + 1}: preenchendo observacao ${row.oc}...`);
       await fillObservation(row.oc);
-      console.log('[FLUXO PREENCHER] Observação preenchida.');
+//       console.log('[FLUXO PREENCHER] Observação preenchida.');
       await selectClientByCode(row.clientCode, { clearFirst: true });
-      console.log('[FLUXO PREENCHER] Cliente confirmado.');
+//       console.log('[FLUXO PREENCHER] Cliente confirmado.');
       status(`Linha ${index + 1}: cliente ${row.clientCode} confirmado.`);
       const productInput = getCalebeDoc().getElementById('inlinePrdCodigo');
       const automaticProduct = await fillSelectedProduct(row);
@@ -912,16 +923,20 @@
       status(`Linha ${index + 1}: produto carregado; aplicando coeficiente e calculando quantidade para ${money(row.total)}...`);
       await fillSingleItem(row.total);
       await closeDavSequence(row);
+      davCloseRequested = true;
       row.status = 'done';
       await saveState();
       renderRows();
       status(`Linha ${index + 1} concluida: ${row.oc} - ${money(row.total)}.`, 'ok');
     } catch (e) {
-      console.error('[Calebe Helper]', e);
+//       console.error('[Calebe Helper]', e);
     } finally {
       state.busy = false;
       renderRows();
-      if (!state.multiSession) restorePanelAfterFill();
+      if (!state.multiSession) {
+        if (davCloseRequested && emitNoteEnabled()) armEmissionWait();
+        else restorePanelAfterFill();
+      }
     }
   }
 
@@ -1094,7 +1109,7 @@
     state.settings.geometry = { left, top, width: r.width, height: r.height };
     saveState().catch(error => {
       if (!isExtensionContextInvalidatedError(error)) {
-        console.error('[Calebe Helper] Falha ao salvar geometria:', error);
+//         console.error('[Calebe Helper] Falha ao salvar geometria:', error);
       }
     });
   }
@@ -1288,6 +1303,108 @@
     }, 180);
   }
 
+  function emitNoteEnabled() {
+    try { return localStorage.getItem(EMIT_STORAGE_KEY) === 'true'; } catch { return false; }
+  }
+
+  function isEmissionPopup(detail) {
+    const name = String(detail?.name || '');
+    const url = String(detail?.url || '');
+    if (/calebeHelperThermalPrint/i.test(name)) return false;
+    if (/dav0[12]_pdf\.php/i.test(url)) return false;
+    return true;
+  }
+
+  function clearEmissionWait() {
+    if (emissionWait?.timer) clearTimeout(emissionWait.timer);
+    if (emissionCandidate?.timer) clearTimeout(emissionCandidate.timer);
+    emissionWait = null;
+    emissionCandidate = null;
+  }
+
+  function restoreAfterEmission() {
+    if (!emissionWait) return;
+    clearEmissionWait();
+    restorePanelAfterFill();
+  }
+
+  function associateEmissionWindow(id) {
+    if (!emissionWait || emissionWait.windowId) return;
+    emissionWait.windowId = id;
+    if (emissionWait.timer) {
+      clearTimeout(emissionWait.timer);
+      emissionWait.timer = null;
+    }
+    if (emissionCandidate?.id === id) {
+      clearTimeout(emissionCandidate.timer);
+      emissionCandidate = null;
+    }
+  }
+
+  function armEmissionWait() {
+    if (!autoMinimizedPanel) return;
+    clearEmissionWait();
+    emissionWait = {
+      windowId: null,
+      timer: setTimeout(() => {
+        if (emissionWait && !emissionWait.windowId) restoreAfterEmission();
+      }, EMISSION_WINDOW_WAIT_MS)
+    };
+  }
+
+  function onEmissionWindowOpened(detail) {
+    if (!detail?.id) return;
+    const id = String(detail.id);
+    emissionPopups.set(id, String(detail.url || ''));
+    if (!emissionWait || emissionWait.windowId) return;
+    if (!isEmissionPopup(detail)) return;
+
+    if (detail.url && !/^about:blank$/i.test(String(detail.url))) {
+      if (emissionCandidate) {
+        clearTimeout(emissionCandidate.timer);
+        emissionCandidate = null;
+      }
+      associateEmissionWindow(id);
+      return;
+    }
+
+    if (emissionCandidate) return;
+    emissionCandidate = {
+      id,
+      timer: setTimeout(() => {
+        if (emissionCandidate?.id !== id) return;
+        emissionCandidate = null;
+        if (!emissionWait || emissionWait.windowId || !emissionPopups.has(id)) return;
+        if (isEmissionPopup({ url: emissionPopups.get(id) })) associateEmissionWindow(id);
+      }, EMISSION_WINDOW_SETTLE_MS)
+    };
+  }
+
+  function onEmissionWindowUrl(detail) {
+    if (!detail?.id) return;
+    const id = String(detail.id);
+    emissionPopups.set(id, String(detail.url || ''));
+    if (emissionWait?.windowId === id && !isEmissionPopup(detail)) {
+      emissionWait.windowId = null;
+      if (!emissionWait.timer) {
+        emissionWait.timer = setTimeout(() => {
+          if (emissionWait && !emissionWait.windowId) restoreAfterEmission();
+        }, EMISSION_WINDOW_WAIT_MS);
+      }
+    }
+  }
+
+  function onEmissionWindowClosed(detail) {
+    if (!detail?.id) return;
+    const id = String(detail.id);
+    emissionPopups.delete(id);
+    if (emissionCandidate?.id === id) {
+      clearTimeout(emissionCandidate.timer);
+      emissionCandidate = null;
+    }
+    if (emissionWait?.windowId === id) restoreAfterEmission();
+  }
+
   function minimizePanelForFill() {
     if (root.classList.contains('ch-collapsed')) return;
     autoMinimizedPanel = true;
@@ -1297,6 +1414,7 @@
   }
 
   function restorePanelAfterFill() {
+    clearEmissionWait();
     if (!autoMinimizedPanel) return;
     autoMinimizedPanel = false;
     const right = root.getBoundingClientRect().right;
@@ -1310,6 +1428,17 @@
     const right = root.getBoundingClientRect().right;
     root.classList.toggle('ch-collapsed');
     root.style.left = `${Math.max(0, right - root.getBoundingClientRect().width)}px`;
+  });
+
+  document.addEventListener('calebe-helper:window-opened', event => onEmissionWindowOpened(event.detail));
+  document.addEventListener('calebe-helper:window-url', event => onEmissionWindowUrl(event.detail));
+  document.addEventListener('calebe-helper:window-closed', event => onEmissionWindowClosed(event.detail));
+  document.addEventListener('calebe-helper:emission-confirmed', () => restoreAfterEmission());
+  window.addEventListener('message', event => {
+    if (event.origin && event.origin !== window.location.origin) return;
+    const data = event.data;
+    if (!data || data.source !== 'calebe-helper' || data.event !== 'emission-confirmed') return;
+    restoreAfterEmission();
   });
 
   root.addEventListener('pointerdown', () => {
@@ -1348,6 +1477,6 @@
 
   enableDragResize();
   window.calebeHelperSelectClientByCode = selectClientByCode;
-  loadState().catch(e => console.error('[Calebe Helper] Falha ao carregar:', e));
-  console.info(`[Calebe Helper] v${APP_VERSION} carregado em`, location.href);
+  loadState().catch(e => /* console.error('[Calebe Helper] Falha ao carregar:', e) */ void 0);
+//   console.info(`[Calebe Helper] v${APP_VERSION} carregado em`, location.href);
 })();

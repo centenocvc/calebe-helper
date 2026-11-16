@@ -5,11 +5,13 @@
   const STYLE_ID = 'calebe-helper-cliente-cadastro-style';
   const GROUP_CLASS = 'calebe-helper-cadastro-salvar-dav';
   const FLOW_KEY = 'calebeHelperNewClientDavFlowV1';
+  const FLOW_MAX_AGE_MS = 2 * 60 * 1000;
   const LOG = '[Calebe Cadastro]';
 
   let observedFrame = null;
   let observedFrameDocument = null;
   let frameObserver = null;
+  let flowTimer = null;
   let busy = false;
 
   function getStorage() {
@@ -22,6 +24,22 @@
     catch (_) { return null; }
   }
 
+  function readActiveFlow() {
+    const flow = readFlow();
+    if (!flow) return null;
+
+    const createdAt = Number(flow.createdAt) || 0;
+    if (!createdAt || Date.now() - createdAt > FLOW_MAX_AGE_MS) {
+//       console.warn(LOG, 'Fluxo de salvamento antigo descartado.');
+      clearFlow();
+      const doc = getFrameDocument();
+      if (doc?.documentElement) setBusy(doc, false);
+      return null;
+    }
+
+    return flow;
+  }
+
   function writeFlow(flow) {
     getStorage().setItem(FLOW_KEY, JSON.stringify(flow));
     return flow;
@@ -29,7 +47,39 @@
 
   function clearFlow() {
     try { getStorage().removeItem(FLOW_KEY); } catch (_) {}
+    if (flowTimer) {
+      clearTimeout(flowTimer);
+      flowTimer = null;
+    }
     busy = false;
+  }
+
+  function scheduleFlowExpiry() {
+    if (flowTimer) return;
+
+    const flow = readFlow();
+    if (!flow) return;
+
+    const createdAt = Number(flow.createdAt) || 0;
+    const age = createdAt ? Date.now() - createdAt : FLOW_MAX_AGE_MS;
+    const delay = Math.max(0, FLOW_MAX_AGE_MS - age) + 100;
+
+    flowTimer = setTimeout(() => {
+      flowTimer = null;
+
+      const currentFlow = readFlow();
+      if (!currentFlow) return;
+
+      if (readActiveFlow()) {
+        scheduleFlowExpiry();
+        return;
+      }
+
+      const doc = getFrameDocument();
+      if (doc?.documentElement) setBusy(doc, false);
+
+//       console.warn(LOG, 'Salvamento não confirmado a tempo. Botão + DAV reabilitado.');
+    }, delay);
   }
 
   function getMainFrame() {
@@ -58,14 +108,242 @@
 
     // No SATGO, cadastro novo usa id="0".
     // Apenas IDs positivos representam clientes já cadastrados.
-    if (/^\d+$/.test(id) && Number(id) > 0) return false;
+    if (isSavedClientId(id)) return false;
+    if (id === '0') return true;
 
-    const href = String(doc.location?.href || '');
-    const action = String(
-      new URL(href, href).searchParams.get('acao') || ''
-    ).toLowerCase();
+    let action = '';
+
+    try {
+      action = String(
+        new URL(doc.location.href).searchParams.get('acao') || ''
+      ).toLowerCase();
+    } catch (_) {}
 
     return action === 'novo' || !id;
+  }
+
+  function isSavedClientId(value) {
+    return /^\d+$/.test(String(value || '')) && Number(value) > 0;
+  }
+
+  function normalizeLookupText(value) {
+    return String(value ?? '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toUpperCase();
+  }
+
+  function captureClientIdentity(doc) {
+    const form = doc?.getElementById('formClifor');
+    if (!form) return null;
+
+    const read = name => String(
+      form.querySelector(`[name="${name}"]`)?.value ?? ''
+    ).trim();
+
+    const documentRaw = read('ClienteCGC');
+    const nameRaw = read('ClienteRazaoSocial');
+
+    return {
+      document: documentRaw.replace(/\D/g, ''),
+      documentRaw,
+      name: normalizeLookupText(nameRaw),
+      nameRaw,
+      cep: normalizeLookupText(read('ClienteCep')),
+      street: normalizeLookupText(read('ClienteLogradouro')),
+      number: normalizeLookupText(read('ClienteNumero')),
+      complement: normalizeLookupText(read('ClienteComplemento')),
+      district: normalizeLookupText(read('ClienteBairro')),
+      city: normalizeLookupText(read('ClienteMunicipio')),
+      state: normalizeLookupText(read('ClienteUf')),
+      chave: read('chave')
+    };
+  }
+
+  function isClientListingPage(doc) {
+    try {
+      return /\/clca01\.php$/i.test(new URL(doc.location.href).pathname);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function isClientListing(doc) {
+    if (!doc?.documentElement) return false;
+    if (isClientListingPage(doc)) return true;
+
+    return Boolean(
+      doc.getElementById('formFiltro') &&
+      doc.querySelector('input[name="q"]')
+    );
+  }
+
+  function getListingChave(doc, flow) {
+    try {
+      const chave = new URL(doc.location.href).searchParams.get('chave');
+      if (chave) return chave;
+    } catch (_) {}
+
+    return String(
+      doc.querySelector('input[name="chave"]')?.value ||
+      flow?.identity?.chave ||
+      ''
+    ).trim();
+  }
+
+  function clientIdentityMatches(row, identity) {
+    const document = String(row.ClienteCGC || '').replace(/\D/g, '');
+
+    if (document && identity.document) {
+      return document === identity.document;
+    }
+
+    if (identity.name) {
+      return normalizeLookupText(row.ClienteRazaoSocial) === identity.name;
+    }
+
+    return false;
+  }
+
+  const ADDRESS_FIELDS = [
+    ['cep', 'ClienteCep'],
+    ['street', 'ClienteLogradouro'],
+    ['number', 'ClienteNumero'],
+    ['complement', 'ClienteComplemento'],
+    ['district', 'ClienteBairro'],
+    ['city', 'ClienteMunicipio'],
+    ['state', 'ClienteUf']
+  ];
+
+  function clientAddressScore(row, identity) {
+    return ADDRESS_FIELDS.reduce((score, [key, rowKey]) => {
+      if (!identity[key]) return score;
+      return score + (
+        normalizeLookupText(row[rowKey]) === identity[key] ? 1 : 0
+      );
+    }, 0);
+  }
+
+  async function fetchClientListJson(doc, chave, field, term, page = 1) {
+    const url = new URL('clca01.php', doc.location.href);
+    url.searchParams.set('fmt', 'json');
+    url.searchParams.set('p', String(page));
+    url.searchParams.set('campo', field);
+    url.searchParams.set('q', term);
+    if (chave) url.searchParams.set('chave', chave);
+
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const response = await (doc.defaultView || window).fetch(url.href, {
+          credentials: 'same-origin',
+          cache: 'no-store',
+          headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (!Array.isArray(data.rows)) throw new Error('Resposta JSON inválida.');
+        return data;
+      } catch (error) {
+        lastError = error;
+        await new Promise(resolve => setTimeout(resolve, attempt * 300));
+      }
+    }
+
+    throw lastError;
+  }
+
+  async function fetchClientListRows(doc, chave, field, term) {
+    const first = await fetchClientListJson(doc, chave, field, term, 1);
+    const rows = [...first.rows];
+    const pageSize = first.rows.length;
+
+    if (!pageSize) return { rows, total: Number(first.total) || 0 };
+
+    const total = Number(first.total) || pageSize;
+    const lastPage = Math.ceil(total / pageSize);
+    const pages = new Set();
+
+    for (let page = 2; page <= Math.min(lastPage, 5); page++) pages.add(page);
+    if (lastPage > 5) pages.add(lastPage);
+
+    for (const page of pages) {
+      try {
+        const data = await fetchClientListJson(doc, chave, field, term, page);
+        rows.push(...data.rows);
+      } catch (error) {
+//         console.warn(LOG, `Falha ao consultar a página ${page} da listagem.`, error);
+        break;
+      }
+    }
+
+    const seenCodes = new Set();
+    return {
+      total,
+      rows: rows.filter(row => {
+        const code = String(row.ClienteCodigo || '').trim();
+        if (!code) return true;
+        if (seenCodes.has(code)) return false;
+        seenCodes.add(code);
+        return true;
+      })
+    };
+  }
+
+  async function resolveNewClientFromListing(doc, flow) {
+    const identity = flow?.identity || {};
+    const chave = getListingChave(doc, flow);
+    const queries = [];
+    const seen = new Set();
+    const matches = [];
+
+    if (identity.documentRaw) queries.push(['ClienteCGC', identity.documentRaw]);
+    if (identity.document && identity.document !== identity.documentRaw) {
+      queries.push(['ClienteCGC', identity.document]);
+    }
+    if (identity.nameRaw) queries.push(['ClienteRazaoSocial', identity.nameRaw]);
+    if (identity.name && identity.name !== identity.nameRaw) {
+      queries.push(['ClienteRazaoSocial', identity.name]);
+    }
+
+    for (const [field, term] of queries) {
+      const key = `${field}:${term}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      let result = { rows: [], total: 0 };
+      try {
+        result = await fetchClientListRows(doc, chave, field, term);
+//         console.info(LOG, `Listagem por ${field} retornou ${result.rows.length} de ${result.total} linha(s).`);
+      } catch (error) {
+//         console.warn(LOG, `Falha ao consultar a listagem por ${field}.`, error);
+        continue;
+      }
+
+      for (const row of result.rows) {
+        if (!clientIdentityMatches(row, identity)) continue;
+        const code = String(row.ClienteCodigo || '').trim();
+        if (!isSavedClientId(code)) continue;
+        matches.push({
+          code,
+          score: clientAddressScore(row, identity)
+        });
+      }
+
+      if (matches.length) break;
+    }
+
+    if (!matches.length) return '';
+
+    matches.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return Number(b.code) - Number(a.code);
+    });
+
+    return matches[0].code;
   }
 
   function installStyle(doc) {
@@ -158,6 +436,20 @@
     const form = doc.getElementById('formClifor');
     if (!form) throw new Error('#formClifor não encontrado.');
 
+    /*
+     * O botão Salvar original pertence ao SATGO. Acioná-lo de fato é mais
+     * fiel do que disparar um submit sintético, pois preserva validações,
+     * confirmações e qualquer lógica ligada ao clique nativo.
+     */
+    const nativeSave = doc.querySelector(
+      `.${GROUP_CLASS} > .calebe-cadastro-salvar`
+    );
+
+    if (nativeSave && typeof nativeSave.click === 'function') {
+      nativeSave.click();
+      return;
+    }
+
     const win = doc.defaultView || window;
     form.dispatchEvent(new win.Event('submit', {
       bubbles: true,
@@ -166,27 +458,30 @@
   }
 
   function startSaveAndDav(doc) {
-    if (busy || readFlow()) return;
+    if (busy || readActiveFlow()) return;
 
     if (!isNewClientForm(doc)) {
-      console.warn(LOG, 'O botão + DAV deste arquivo é exclusivo do cadastro de cliente novo.');
+//       console.warn(LOG, 'O botão + DAV deste arquivo é exclusivo do cadastro de cliente novo.');
       return;
     }
 
     writeFlow({
       version: 1,
       stage: 'saving-new-client',
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      identity: captureClientIdentity(doc)
     });
 
+//     console.info(LOG, 'Salvando novo cliente e preparando a abertura do DAV.');
     setBusy(doc, true);
+    scheduleFlowExpiry();
 
     try {
       dispatchNativeSave(doc);
     } catch (error) {
       clearFlow();
       setBusy(doc, false);
-      console.error(LOG, error);
+//       console.error(LOG, error);
     }
   }
 
@@ -237,6 +532,7 @@
     const candidates = [...doc.querySelectorAll('button.btn.btn-primary')]
       .filter(button => {
         if (button.closest(`.${GROUP_CLASS}`)) return false;
+        if (!button.getClientRects().length) return false;
         const text = String(button.textContent || '').trim();
         if (!/^Salvar(?:\s+Alterações)?$/i.test(text)) return false;
 
@@ -248,53 +544,87 @@
       createGroup(doc, saveButton);
     }
 
-    setBusy(doc, Boolean(readFlow()));
+    setBusy(doc, Boolean(readActiveFlow()));
   }
 
   function hasVisibleSaveError(doc) {
-    return Boolean(doc.querySelector(
-      '.alert-danger, .alert-error, .alert.alert-danger, .text-danger.alert'
-    ));
+    const elements = doc.querySelectorAll(
+      '.alert-danger, .alert-error, .alert.alert-danger, .text-danger.alert, ' +
+      '.invalid-feedback, .is-invalid'
+    );
+
+    for (const element of elements) {
+      if (!element.getClientRects || !element.getClientRects().length) continue;
+      if (element.classList.contains('is-invalid')) return true;
+      if (String(element.textContent || '').trim()) return true;
+    }
+
+    return false;
   }
 
   async function continueAfterSave(doc) {
-    const flow = readFlow();
+    const flow = readActiveFlow();
     if (!flow || flow.stage !== 'saving-new-client') return;
 
-    if (hasVisibleSaveError(doc)) {
+    if (!isClientListing(doc) && hasVisibleSaveError(doc)) {
       clearFlow();
       setBusy(doc, false);
-      console.error(LOG, 'O SATGO exibiu erro ao salvar o novo cliente. O DAV não será aberto.');
+//       console.error(LOG, 'O SATGO exibiu erro ao salvar o novo cliente. O DAV não será aberto.');
       return;
     }
 
-    const clientId = getCurrentClientId(doc);
+    let clientId = getCurrentClientId(doc);
 
-    /*
-     * Depois do salvamento o SATGO precisa nos fornecer o código real
-     * do cliente. Não tentamos adivinhar código sequencial.
-     */
-    if (!/^\d+$/.test(clientId)) {
-      /*
-       * Se o servidor voltou para uma página que ainda não expõe o ID,
-       * mantemos o fluxo pendente. Uma futura alteração/load pode trazer
-       * o formulário de edição com o código confirmado.
-       */
-      return;
+    if (!isSavedClientId(clientId)) {
+      if (!isClientListing(doc)) {
+//         console.info(
+//           LOG,
+//           `Salvamento aguardando confirmação do código do cliente (id="${clientId || 'vazio'}").`
+//         );
+        return;
+      }
+
+      const resolvingFlow = readActiveFlow();
+      if (!resolvingFlow) return;
+
+      writeFlow({ ...resolvingFlow, stage: 'resolving-new-client' });
+//       console.info(LOG, 'Salvamento concluído na listagem; localizando o novo cliente.');
+
+      try {
+        clientId = await resolveNewClientFromListing(doc, resolvingFlow);
+      } catch (error) {
+//         console.error(LOG, 'Falha ao localizar o novo cliente na listagem.', error);
+        clientId = '';
+      }
+
+      if (!readActiveFlow()) return;
+
+      if (!isSavedClientId(clientId)) {
+        clearFlow();
+        setBusy(doc, false);
+//         console.warn(
+//           LOG,
+//           'Cliente salvo, mas o código não foi localizado na listagem. O DAV não foi aberto.'
+//         );
+        return;
+      }
+
+//       console.info(LOG, `Novo cliente ${clientId} localizado na listagem.`);
     }
 
     const api = window.calebeHelperClientDav;
     if (!api?.createDavForClient) {
       clearFlow();
       setBusy(doc, false);
-      console.error(LOG, 'clientedav.js não disponibilizou createDavForClient().');
+//       console.error(LOG, 'clientedav.js não disponibilizou createDavForClient().');
       return;
     }
 
     writeFlow({
       ...flow,
       stage: 'opening-dav',
-      clientId
+      clientId,
+      createdAt: Date.now()
     });
 
     try {
@@ -303,10 +633,10 @@
         name: ''
       });
       clearFlow();
-      console.info(LOG, `Novo cliente ${clientId} salvo e DAV aberto.`);
+//       console.info(LOG, `Novo cliente ${clientId} salvo e DAV aberto.`);
     } catch (error) {
       clearFlow();
-      console.error(LOG, 'Cliente salvo, mas não foi possível abrir o DAV.', error);
+//       console.error(LOG, 'Cliente salvo, mas não foi possível abrir o DAV.', error);
     }
   }
 
@@ -317,14 +647,16 @@
     installStyle(doc);
     installButtons(doc);
 
-    const flow = readFlow();
+    const flow = readActiveFlow();
     if (!flow) return;
+
+    scheduleFlowExpiry();
 
     if (flow.stage === 'saving-new-client' && fromLoad) {
       continueAfterSave(doc).catch(error => {
         clearFlow();
         setBusy(doc, false);
-        console.error(LOG, error);
+//         console.error(LOG, error);
       });
     }
   }
@@ -340,9 +672,21 @@
       installButtons(doc);
 
       /*
-       * Mutation não é usada como confirmação do salvamento.
-       * O avanço para o DAV acontece somente após novo load do iframe.
+       * Normalmente o SATGO recarrega o iframe após salvar. Este fallback
+       * cobre o caso de o código do cliente aparecer na própria página,
+       * sem nova navegação (ex.: salvamento via AJAX).
        */
+      const flow = readActiveFlow();
+      if (flow?.stage === 'saving-new-client') {
+        const id = getCurrentClientId(doc);
+        if (isSavedClientId(id) || isClientListingPage(doc)) {
+          continueAfterSave(doc).catch(error => {
+            clearFlow();
+            setBusy(doc, false);
+//             console.error(LOG, error);
+          });
+        }
+      }
     });
 
     frameObserver.observe(doc.documentElement, {

@@ -177,9 +177,9 @@
           const win = latestIe.ownerDocument.defaultView || window;
           latestIe.dispatchEvent(new win.Event('input', { bubbles: true }));
           latestIe.dispatchEvent(new win.Event('change', { bubbles: true }));
-        } else if (!value) console.info(LOG, 'Sintegra não retornou IE para o CNPJ informado.');
+        } else if (!value) /* console.info(LOG, 'Sintegra não retornou IE para o CNPJ informado.') */ void 0;
       })
-      .catch(error => console.warn(LOG, 'Consulta Sintegra indisponível:', error.message))
+      .catch(error => /* console.warn(LOG, 'Consulta Sintegra indisponível:', error.message) */ void 0)
       .finally(() => sintegraRequests.delete(requestedCnpj));
     sintegraRequests.set(requestedCnpj, request);
   }
@@ -592,7 +592,7 @@
 
     installBirthdayObserver(doc);
 
-    console.info(LOG, 'Padronizações instaladas no formulário de cliente.');
+//     console.info(LOG, 'Padronizações instaladas no formulário de cliente.');
     return true;
   }
 
