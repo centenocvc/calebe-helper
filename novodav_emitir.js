@@ -68,6 +68,18 @@
   const loadThermalPending = () => { thermalPending ||= loadState(THERMAL_PENDING_KEY, WAIT_THERMAL_CONFIRM_MS); };
   const clearThermalPending = () => { thermalPending = null; removeState(THERMAL_PENDING_KEY); };
 
+  // ⬛ Bloco: se o DAV não fechou (erro), fecha a aba reservada para não ficar "travada" na contagem.
+  function closeThermalWindow(doc) {
+    if (!thermalPending?.reserved) return;
+    try { (doc?.defaultView || window).open('', THERMAL_WINDOW_NAME)?.close(); } catch { }
+  }
+
+  function abortThermalPrint(doc) {
+    stopThermalTitle();
+    closeThermalWindow(doc);
+    clearThermalPending();
+  }
+
   function dispatchPageCommand(doc, detail) {
     try {
       const EventCtor = doc.defaultView?.CustomEvent || CustomEvent;
@@ -274,6 +286,32 @@
     observedPrintSelects.add(select);
   }
 
+  // ⬛ Bloco: validações prévias (espelhe aqui as mesmas regras que o sistema aplica nos tipos nativos).
+  const CLIENT_NAME_SELECTOR = '#cliNome, input[name="cliNome"]'; // AJUSTAR para o campo real do cliente
+
+  function getThermalBlockReason() {
+    for (const doc of getFrameDocuments()) {
+      const field = doc.querySelector(CLIENT_NAME_SELECTOR);
+      if (field) return normalize(field.value).length < 2 ? 'Nome de cliente inválido.' : '';
+    }
+    return ''; // campo não encontrado: não bloqueia (a rede de segurança abaixo fecha a aba se houver erro)
+  }
+
+  // ⬛ Bloco: detecta erro de validação mostrado pelo sistema logo após o clique (alert nativo, SweetAlert, modal, toast).
+  const VALIDATION_WAIT_MS = 300;
+  const ERROR_ELEMENTS = '.swal2-container, .swal-overlay, .modal.show, .alert, .toast, .noty_bar, .toastify, [role="alert"], [role="alertdialog"]';
+  const ERROR_TEXT = /erro|inv[aá]lid|obrigat|informe|preencha|n[aã]o foi poss[ií]vel|falha|n[aã]o (?:pode|permitid)/i;
+
+  const visibleErrorElements = () => getFrameDocuments()
+    .flatMap(doc => [...doc.querySelectorAll(ERROR_ELEMENTS)])
+    .filter(el => el.getClientRects().length);
+
+  function hasValidationError(clickedAt, errorsBefore) {
+    // window.alert() trava a página: o timer só dispara depois que o alerta é fechado.
+    if (Date.now() - clickedAt > VALIDATION_WAIT_MS + 400) return true;
+    return visibleErrorElements().some(el => !errorsBefore.has(el) && ERROR_TEXT.test(el.textContent || ''));
+  }
+
   // ⬛ Bloco: registra a impressão térmica somente na confirmação do pagamento.
   function beginPendingThermalPrint(doc, control) {
     if (!isPaymentAttentionPage(doc) || !isFinalizationControl(control)) return;
@@ -284,9 +322,14 @@
     }
     if (printType !== THERMAL_OPTION_VALUE) return;
 
+    // Com erro de validação o sistema já mostra o alerta: não reserva a aba.
+    if (getThermalBlockReason()) return;
+
     const sourceUrl = String(doc.location?.href || '');
     const davId = davIdFromUrl(sourceUrl);
-    thermalPending = { createdAt: Date.now(), davId, sourceUrl };
+    thermalPending = { createdAt: Date.now(), davId, sourceUrl, reserved: false };
+    const clickedAt = Date.now();
+    const errorsBefore = new Set(visibleErrorElements());
 
     // Monta a mesma URL que os tipos nativos usam (animação/carregamento igual)
     let reserveUrl = 'about:blank';
@@ -310,11 +353,17 @@
 //       console.warn('[Calebe Helper] Não foi possível montar dav01_pdf.php; usando about:blank.', e);
     }
 
-    dispatchPageCommand(doc, {
-      action: 'reserve-thermal-print-window',
-      url: reserveUrl
-    });
     saveState(THERMAL_PENDING_KEY, thermalPending);
+
+    // O clique nativo roda logo após este (captura); espera ele validar e só reserva a aba se não houve erro.
+    window.setTimeout(() => {
+      if (!thermalPending || thermalPending.reserved) return;
+      if (hasValidationError(clickedAt, errorsBefore)) return clearThermalPending();
+
+      thermalPending.reserved = true;
+      dispatchPageCommand(doc, { action: 'reserve-thermal-print-window', url: reserveUrl });
+      saveState(THERMAL_PENDING_KEY, thermalPending);
+    }, VALIDATION_WAIT_MS);
 
 //     console.info(
 //       `[Calebe Helper] ATENÇÃO AO PAGAMENTO: fechamento solicitado; janela de impressão reservada (${reserveUrl === 'about:blank' ? 'about:blank' : 'dav01_pdf.php'}) e aguardando confirmação do servidor por até ${WAIT_THERMAL_CONFIRM_MS / 1000} segundos.`
@@ -326,7 +375,7 @@
     loadThermalPending();
     if (thermalPending && Date.now() - thermalPending.createdAt > WAIT_THERMAL_CONFIRM_MS) {
 //       console.warn('[Calebe Helper] O servidor não confirmou o fechamento do DAV dentro do prazo; a impressão térmica não foi acionada.');
-      clearThermalPending();
+      abortThermalPrint();
     }
   }
 
@@ -393,9 +442,8 @@
     if (!thermalPending) return;
 
     const fail = message => {
-      stopThermalTitle();
 //       console.error(`[Calebe Helper] ${message}`);
-      clearThermalPending();
+      abortThermalPrint(sourceDoc);
     };
 
     const davId = Number(detail.davId || thermalPending.davId) || null;
@@ -578,7 +626,15 @@
   // ⬛ Bloco: recebe a confirmação real da mesma resposta usada pelo fechamento nativo.
   function onDavCloseConfirmed(doc, event) {
     const detail = event.detail || {};
-    if (!detail.ok) return;
+    if (!detail.ok) {
+      // Erro no fechamento: fecha a aba reservada para o alerta do sistema ficar visível.
+      loadThermalPending();
+      const failedId = Number(detail.davId) || null;
+      if (thermalPending && (!failedId || !thermalPending.davId || Number(thermalPending.davId) === failedId)) {
+        abortThermalPrint(doc);
+      }
+      return;
+    }
 
     loadThermalPending();
     if (thermalPending) {

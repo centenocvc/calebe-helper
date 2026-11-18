@@ -59,9 +59,9 @@
         "dav_carregarmais.js",
         "dashboardatalhos.js",
         "fillexcel_modal.js",
+        "novodav_cliente.js",
         "novodav_emitir.js",
         "novodav_cof.js",
-		"novodav_cliente.js",
         "xml-downloader.js"
       ],
       "css": [

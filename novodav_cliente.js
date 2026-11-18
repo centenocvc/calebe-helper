@@ -1,6 +1,6 @@
 /* global chrome */
 /**
- * novodav_cliente.js — v2
+ * novodav_cliente.js — v2.1
  *
  * Busca unificada no campo #cliNome da tela de criação de DAV.
  * - Pesquisa por razão social (tipo 0 — já nativo), fantasia (tipo 1) e CPF/CNPJ (tipo 4).
@@ -9,6 +9,9 @@
  * - Clique (ou Enter) no resultado preenche #cliNome com o nome do cliente, nunca com o código.
  * - Overlay do cliente selecionado compartilhado com o fillexcel_modal.js.
  * - Clique em #cliNome libera o campo para uma nova pesquisa (limpa cliente/overlay).
+ * - NÃO zera o #cliId: o Calebe usa '1' (CONSUMIDOR) como fallback para cliente livre.
+ * - Cliente livre (nome não cadastrado): o Calebe mantém cliId='1' e o DAV emite.
+ * - Nome em maiúsculo no blur (sem quebrar a busca durante a digitação).
  * - NÃO substitui window.fetch do Calebe. NÃO mexe no fillexcel_modal.js.
  */
 (() => {
@@ -30,14 +33,14 @@
     if (frame) {
       try { return frame.contentDocument || document; } catch (_) { return document; }
     }
-    return document;   // ← sem iframe: o Calebe é o próprio document
+    return document;
   };
   const getCalebeWin = () => {
     const frame = document.getElementById('mainIframe');
     if (frame) {
       try { return frame.contentWindow || window; } catch (_) { return window; }
     }
-    return window;     // ← sem iframe: o Calebe é a própria window
+    return window;
   };
 
   // ⬛ Bloco: chave de sessão exigida pelo backend do SATGO
@@ -125,17 +128,13 @@
           Accept: 'application/json, text/plain, */*'
         }
       });
-      if (!resp.ok) {
-//         console.warn(`${LOG} busca tipo=${tipo} status ${resp.status}`);
-        return [];
-      }
+      if (!resp.ok) return [];
       const data = await resp.json();
       if (Array.isArray(data)) return data;
       if (Array.isArray(data?.clientes)) return data.clientes;
       if (Array.isArray(data?.data)) return data.data;
       return [];
     } catch (e) {
-//       console.warn(`${LOG} busca tipo=${tipo} falhou:`, e);
       return [];
     }
   }
@@ -317,8 +316,6 @@
   }
 
   // ⬛ Bloco: injetar resultados extras (fantasia + CPF/CNPJ) no dropdown nativo
-  // O Calebe já injeta os resultados do tipo 0 (razão) no #cli_ac via acCarregarMaisClientes.
-  // Nós padronizamos o layout dos itens e acrescentamos os resultados dos tipos 1 e 4, sem duplicar.
   function getAcItemCodes(ac) {
     const codes = new Set();
     ac.querySelectorAll('.ac-item:not(.nc-extra-item)').forEach(el => {
@@ -528,7 +525,7 @@
   async function injectExtraResults(termo) {
     const doc = getCalebeDoc();
     const ac = doc.getElementById('cli_ac');
-    if (!ac) return;
+    if (!ac) return { found: false, extras: 0 };
 
     const tipos = [TIPOS.FANTASIA];
     if (/\d/.test(termo)) tipos.push(TIPOS.DOC);
@@ -540,18 +537,18 @@
     for (const row of flat) {
       if (!row?.ClienteCodigo) continue;
       const code = String(row.ClienteCodigo);
-      if (existing.has(code)) continue;   // já está no dropdown nativo (tipo 0)
+      if (existing.has(code)) continue;
       byCode.set(code, row);
     }
 
     const input = doc.getElementById('cliNome');
-    if (!input || String(input.value || '').trim() !== termo) return;
-    if (ac.style.display === 'none') return;
+    if (!input || String(input.value || '').trim() !== termo) return { found: false, extras: 0 };
+    if (ac.style.display === 'none') return { found: false, extras: 0 };
 
     ac.querySelectorAll('.nc-extra-item').forEach(el => el.remove());
 
     const extras = [...byCode.values()];
-    if (!extras.length) return;
+    if (!extras.length) return { found: false, extras: 0 };
 
     removeNativeEmptyState(ac);
     const list = ensureAcList(ac, doc);
@@ -563,6 +560,7 @@
       list.insertBefore(buildExtraAcItem(doc, row), insertAnchor);
     }
     ac.style.display = 'block';
+    return { found: true, extras: extras.length };
   }
 
   // ⬛ Bloco: observa o dropdown #cli_ac e injeta extras quando o Calebe popular
@@ -575,6 +573,35 @@
 
     let lastTermo = '';
     let debounceTimer = null;
+    let observer = null;
+    let observerVis = null;
+    let inFlight = false;
+
+    const stopObservers = () => {
+      if (observer) { observer.disconnect(); observer = null; }
+      if (observerVis) { observerVis.disconnect(); observerVis = null; }
+      inFlight = false;
+    };
+
+    const startObservers = () => {
+      if (observer) return;
+      observer = new doc.defaultView.MutationObserver(() => {
+        if (ac.style.display === 'none') { stopObservers(); return; }
+        formatNativeAcItems(ac);
+        const temExtras = Boolean(ac.querySelector('.nc-extra-item'));
+        if (!temExtras) lastTermo = '';
+        else if (hasNativeEmptyState(ac)) removeNativeEmptyState(ac);
+        scheduleInject();
+      });
+      observer.observe(ac, { childList: true, subtree: true });
+
+      observerVis = new doc.defaultView.MutationObserver(() => {
+        if (ac.style.display === 'none') { stopObservers(); return; }
+        formatNativeAcItems(ac);
+        scheduleInject();
+      });
+      observerVis.observe(ac, { attributes: true, attributeFilter: ['style', 'class'] });
+    };
 
     const scheduleInject = () => {
       const termo = String(input.value || '').trim();
@@ -582,43 +609,43 @@
       if (termo === lastTermo) return;
       lastTermo = termo;
       clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => {
-        if (ac.style.display === 'none') {
-          lastTermo = '';
-          return;
+      debounceTimer = setTimeout(async () => {
+        if (ac.style.display === 'none') { lastTermo = ''; return; }
+        if (inFlight) return;
+        inFlight = true;
+        try {
+          const result = await injectExtraResults(termo);
+          const temNativos = Boolean(ac.querySelector('.ac-item:not(.nc-extra-item)'));
+          if (!result.found && !temNativos) {
+            // Não existe cliente (nem razão, nem fantasia, nem CPF/CNPJ)
+            // Desliga observers e deixa o Calebe agir como nativo.
+            stopObservers();
+            lastTermo = '';
+            // ⬛ NÃO zera o #cliId — o Calebe usa '1' (CONSUMIDOR) como fallback
+            // (se o usuário digitou um nome e não selecionou, o Calebe mantém cliId='1')
+            return;
+          }
+          if (result.found) startObservers();
+        } finally {
+          inFlight = false;
         }
-        injectExtraResults(termo).catch(e => /* console.warn(`${LOG} injectExtraResults falhou:`, e) */ void 0);
-      }, 400);   // depois do Calebe (que tem debounce de 350ms)
+      }, 400);
     };
 
-    // Observa mudanças no conteúdo do #cli_ac (o Calebe reescreve innerHTML)
-    const mo = new doc.defaultView.MutationObserver(() => {
-      // Só age se o dropdown está visível
-      if (ac.style.display === 'none') return;
-      formatNativeAcItems(ac);
-      const temExtras = Boolean(ac.querySelector('.nc-extra-item'));
-      if (!temExtras) {
-        // Calebe reescreveu a lista: permite nova injeção para o mesmo termo
-        lastTermo = '';
-      } else if (hasNativeEmptyState(ac)) {
-        // Remove "Nenhum cliente encontrado" que o Calebe reinseriu
-        removeNativeEmptyState(ac);
+    input.addEventListener('input', () => {
+      const termo = String(input.value || '').trim();
+      if (termo.length < MIN_CHARS) {
+        stopObservers();
+        return;
       }
+      startObservers();
       scheduleInject();
     });
-    mo.observe(ac, { childList: true, subtree: true });
 
-    const moVis = new doc.defaultView.MutationObserver(() => {
-      if (ac.style.display === 'none') return;
+    if (ac.style.display !== 'none') {
+      startObservers();
       formatNativeAcItems(ac);
-      scheduleInject();
-    });
-    moVis.observe(ac, { attributes: true, attributeFilter: ['style', 'class'] });
-
-    if (ac.style.display !== 'none') formatNativeAcItems(ac);
-
-    // Fallback: também escuta o input direto (para quando o Calebe demora)
-    input.addEventListener('input', scheduleInject);
+    }
   }
 
   function triggerAcItemMouseDown(item) {
@@ -729,6 +756,7 @@
   }
 
   // ⬛ Bloco: clique em #cliNome libera o campo para uma nova pesquisa
+  // ⚠️ NÃO zera o #cliId — o Calebe usa '1' (CONSUMIDOR) como fallback para cliente livre.
   function installClientSearchRelease() {
     const doc = getCalebeDoc();
     const input = doc.getElementById('cliNome');
@@ -746,18 +774,8 @@
         overlay.style.display = 'none';
         overlay.innerHTML = '';
       }
+      // ⬛ Só limpa o #cliNome (para nova pesquisa). NÃO zera o #cliId.
       setNativeValue(input, '');
-      if (cliId) setNativeValue(cliId, '');
-
-      const ac = doc.getElementById('cli_ac');
-      if (ac) {
-        ac.style.display = 'none';
-        const hideIfEmpty = () => {
-          if (!String(input.value || '').trim()) ac.style.display = 'none';
-        };
-        setTimeout(hideIfEmpty, 0);
-        setTimeout(hideIfEmpty, 80);
-      }
     });
   }
 
@@ -793,6 +811,26 @@
     cliId.addEventListener('input', handleIdChange);
   }
 
+  // ⬛ Bloco: nome em maiúsculo ao sair do campo (sem quebrar a busca)
+  function installUppercaseOnBlur() {
+    const doc = getCalebeDoc();
+    const input = doc.getElementById('cliNome');
+    if (!input || input.dataset[`${NS}UpperWired`]) return;
+    input.dataset[`${NS}UpperWired`] = '1';
+
+    input.addEventListener('blur', () => {
+      const val = String(input.value || '');
+      if (!val) return;
+      const upper = val.toUpperCase();
+      if (upper !== val) {
+        const win = input.ownerDocument.defaultView;
+        const setter = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, 'value')?.set;
+        setter ? setter.call(input, upper) : (input.value = upper);
+        input.dispatchEvent(new win.Event('change', { bubbles: true }));
+      }
+    });
+  }
+
   // ⬛ Bloco: instala tudo
   function installAll() {
     const doc = getCalebeDoc();
@@ -805,7 +843,7 @@
     installAcObserver();
     installEnterByCodeHandler();
     installClientSelectionWatcher();
-//     console.info(`${LOG} instalado no Calebe (cliente unificado ativo).`);
+    installUppercaseOnBlur();
   }
 
   function waitForCliNomeThenInstall() {
@@ -835,7 +873,6 @@
       frame.dataset[`${NS}Wired`] = '1';
       frame.addEventListener('load', () => setTimeout(waitForCliNomeThenInstall, 150));
     }
-//     console.info(`${LOG} v2 instalado.`);
   };
 
   if (document.readyState === 'loading') {
